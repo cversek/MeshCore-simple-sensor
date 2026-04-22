@@ -23,7 +23,7 @@
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "companion_sensor_receiver v1 (build: Apr 2026)"
+#define FIRMWARE_VER_TEXT   "companion_sensor_receiver v2 (build: Apr 2026) [fwd_hops + dup-detect flood-ACK]"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   910.525
@@ -97,10 +97,23 @@ class ReceiverMesh : public BaseChatMesh, ContactVisitor {
   float last_recv_temp;
   float last_recv_batt;
   uint16_t last_recv_node_id;
-  uint8_t last_recv_hops;
+  uint8_t last_recv_hops;          // hops as measured by us at arrival (aux_1)
+  uint8_t last_recv_fwd_hops;      // v2: hops as claimed by sender's cached out_path (aux_2)
+  char last_recv_fwd_path[48];     // v2: sender's cached path as "aa.bb.cc" or "none"
   bool last_recv_direct;
   char last_recv_from[32];
   bool has_recv;
+
+  // v2: small LRU of recently-handled direct messages, to detect "sender retried
+  // because our last ACK didn't land". Keyed by (sender pub_key prefix, sender timestamp).
+  static constexpr uint8_t DUP_CACHE_SIZE = 8;
+  struct DupEntry {
+    uint8_t sender_prefix[4];
+    uint32_t sender_timestamp;
+    unsigned long seen_millis;
+  };
+  DupEntry dup_cache[DUP_CACHE_SIZE];
+  uint8_t dup_cache_next;  // round-robin slot
 
   // Bayou posting state
   bool post_pending;
@@ -258,33 +271,58 @@ class ReceiverMesh : public BaseChatMesh, ContactVisitor {
     Serial.println("   error: invalid format");
   }
 
-  // Parse "[SENSOR] node_id=1 temp=22.50C batt=3.85V" format
-  bool parseSensorMessage(const char* text, float& temp, float& batt, uint16_t& nid) {
+  // Parse "[SENSOR] node_id=1 temp=22.50C batt=3.85V [fwd_hops=N fwd_path=aa.bb.cc]".
+  // v2: also extracts fwd_hops (uint8) and fwd_path (string). Missing fwd_hops → 0xFF.
+  // fwd_path buffer must be at least `fwd_path_sz` bytes; copies the path as-is,
+  // falling back to "none" when absent.
+  bool parseSensorMessage(const char* text, float& temp, float& batt, uint16_t& nid,
+                          uint8_t& fwd_hops, char* fwd_path, size_t fwd_path_sz) {
     if (memcmp(text, "[SENSOR]", 8) != 0) return false;
 
     const char* np = strstr(text, "node_id=");
     const char* tp = strstr(text, "temp=");
     const char* bp = strstr(text, "batt=");
+    const char* fp = strstr(text, "fwd_hops=");
+    const char* pp = strstr(text, "fwd_path=");
 
-    if (np) {
-      nid = (uint16_t)atoi(np + 8);
-    } else {
-      nid = 0;
-    }
+    nid = np ? (uint16_t)atoi(np + 8) : 0;
+    temp = tp ? (float)atof(tp + 5) : 0.0f;
+    batt = bp ? (float)atof(bp + 5) : 0.0f;
+    fwd_hops = fp ? (uint8_t)atoi(fp + 9) : 0xFF;
 
-    if (tp) {
-      temp = atof(tp + 5);
-    } else {
-      temp = 0;
-    }
-
-    if (bp) {
-      batt = atof(bp + 5);
-    } else {
-      batt = 0;
+    if (pp && fwd_path && fwd_path_sz > 0) {
+      const char* src = pp + 9;  // skip "fwd_path="
+      size_t i = 0;
+      while (i < fwd_path_sz - 1 && src[i] && src[i] != ' ' && src[i] != '\n') {
+        fwd_path[i] = src[i];
+        i++;
+      }
+      fwd_path[i] = 0;
+    } else if (fwd_path && fwd_path_sz > 0) {
+      StrHelper::strncpy(fwd_path, "none", fwd_path_sz);
     }
 
     return (tp != NULL);  // at minimum we need temperature
+  }
+
+  // v2: duplicate detection. Returns true if this (sender, timestamp) was seen
+  // within the last 60 seconds (same message being retried).
+  bool checkAndRecordDuplicate(const uint8_t* sender_pub, uint32_t sender_timestamp) {
+    unsigned long now = millis();
+    for (uint8_t i = 0; i < DUP_CACHE_SIZE; i++) {
+      if (memcmp(dup_cache[i].sender_prefix, sender_pub, 4) == 0 &&
+          dup_cache[i].sender_timestamp == sender_timestamp &&
+          (now - dup_cache[i].seen_millis) < 60UL * 1000UL) {
+        dup_cache[i].seen_millis = now;  // refresh
+        return true;
+      }
+    }
+    // Not a duplicate — record in round-robin slot.
+    memcpy(dup_cache[dup_cache_next].sender_prefix, sender_pub, 4);
+    dup_cache[dup_cache_next].sender_timestamp = sender_timestamp;
+    dup_cache[dup_cache_next].seen_millis = now;
+    dup_cache_next = (dup_cache_next + 1) % DUP_CACHE_SIZE;
+    return false;
   }
 
 #ifdef ESP32
@@ -320,7 +358,8 @@ class ReceiverMesh : public BaseChatMesh, ContactVisitor {
     return false;
   }
 
-  bool postToBayou(float temp, float batt, const char* from_name, uint16_t nid, uint8_t hops) {
+  bool postToBayou(float temp, float batt, const char* from_name, uint16_t nid,
+                   uint8_t hops, uint8_t fwd_hops, const char* fwd_path, bool direct) {
     if (_prefs.bayou_public_key[0] == 0 || _prefs.bayou_private_key[0] == 0) {
       StrHelper::strncpy(last_post_status, "no bayou keys", sizeof(last_post_status));
       Serial.println("   Bayou keys not set, skipping post");
@@ -335,10 +374,18 @@ class ReceiverMesh : public BaseChatMesh, ContactVisitor {
     HTTPClient http;
     String url = String(BAYOU_BASE_URL) + String(_prefs.bayou_public_key);
 
-    char body[256];
+    // v2: aux_1 = hops we measured at arrival; aux_2 = hops as claimed by sender
+    // (255 = sender didn't include field; 255 also = sender's path was unknown).
+    // log = sender's cached hash-byte path + route flag as a structured string;
+    // Bayou's measurements table has `log VARCHAR(255)` for exactly this kind of
+    // free-form metadata. Keep the format key=value so it parses easily downstream.
+    char body[420];
     snprintf(body, sizeof(body),
-             "{\"private_key\":\"%s\",\"node_id\":%u,\"temperature_c\":%.2f,\"battery_volts\":%.3f,\"aux_1\":%u,\"source\":\"%s\"}",
-             _prefs.bayou_private_key, (unsigned)nid, (double)temp, (double)batt, (unsigned)hops, from_name);
+             "{\"private_key\":\"%s\",\"node_id\":%u,\"temperature_c\":%.2f,\"battery_volts\":%.3f,"
+             "\"aux_1\":%u,\"aux_2\":%u,\"log\":\"path=%s route=%s\",\"source\":\"%s\"}",
+             _prefs.bayou_private_key, (unsigned)nid, (double)temp, (double)batt,
+             (unsigned)hops, (unsigned)fwd_hops, fwd_path,
+             direct ? "DIRECT" : "FLOOD", from_name);
 
     Serial.printf("   Posting to Bayou: %s\n", url.c_str());
 
@@ -368,17 +415,23 @@ class ReceiverMesh : public BaseChatMesh, ContactVisitor {
   }
 #endif
 
-  void handleSensorData(const char* from_name, float temp, float batt, uint16_t nid, uint8_t hops, bool direct) {
+  void handleSensorData(const char* from_name, float temp, float batt, uint16_t nid,
+                        uint8_t hops, uint8_t fwd_hops, const char* fwd_path, bool direct) {
     last_recv_temp = temp;
     last_recv_batt = batt;
     last_recv_node_id = nid;
     last_recv_hops = hops;
+    last_recv_fwd_hops = fwd_hops;
+    StrHelper::strncpy(last_recv_fwd_path, fwd_path, sizeof(last_recv_fwd_path));
     last_recv_direct = direct;
     StrHelper::strncpy(last_recv_from, from_name, sizeof(last_recv_from));
     has_recv = true;
 
-    Serial.printf("   [SENSOR DATA] from=%s node_id=%u temp=%.2fC batt=%.2fV radio_hops=%u route=%s\n",
-                  from_name, (unsigned)nid, temp, batt, (unsigned)hops, direct ? "DIRECT" : "FLOOD");
+    Serial.printf("   [SENSOR DATA] from=%s node_id=%u temp=%.2fC batt=%.2fV "
+                  "radio_hops=%u fwd_hops=%u fwd_path=%s route=%s\n",
+                  from_name, (unsigned)nid, temp, batt,
+                  (unsigned)hops, (unsigned)fwd_hops, fwd_path,
+                  direct ? "DIRECT" : "FLOOD");
 
   #ifdef ESP32
     post_pending = true;
@@ -418,7 +471,12 @@ protected:
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
-    Serial.printf("PATH to: %s, path_len=%d\n", contact.name, (uint32_t) contact.out_path_len);
+    // v2: log path bytes, not just length.
+    Serial.printf("PATH to: %s, path_len=%d, hashes=", contact.name, (uint32_t) contact.out_path_len);
+    for (uint8_t h = 0; h < contact.out_path_len; h++) {
+      Serial.printf("%02x%s", contact.out_path[h], h < contact.out_path_len - 1 ? "." : "");
+    }
+    Serial.println();
     saveContacts();
   }
 
@@ -434,21 +492,41 @@ protected:
     Serial.printf("(%s) MSG from %s:\n", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", from.name);
     Serial.printf("   %s\n", text);
 
-    // Check if this is a sensor message
+    // v2: if this is a DIRECT arrival of a message we already handled within 60s,
+    // our previous ACK likely didn't land. Invalidate our cached reverse out_path
+    // so the ACK the base class is about to send (via sendAckTo after this callback
+    // returns) goes out via FLOOD instead of our stale direct path. The flood also
+    // causes the sender to update its forward out_path to a fresh route.
+    bool is_duplicate = checkAndRecordDuplicate(from.id.pub_key, sender_timestamp);
+    if (is_duplicate && pkt->isRouteDirect()) {
+      ContactInfo* c = lookupContactByPubKey(from.id.pub_key, PUB_KEY_SIZE);
+      if (c && c->out_path_len != OUT_PATH_UNKNOWN) {
+        Serial.printf("   DUP: duplicate of recent direct msg from %s — invalidating reverse path "
+                      "(was len=%d). ACK will FLOOD this time.\n",
+                      from.name, (int)c->out_path_len);
+        c->out_path_len = OUT_PATH_UNKNOWN;
+        saveContacts();
+      }
+    }
+
+    // Sensor data extraction (unchanged logic for hops; new fwd_hops + fwd_path in payload).
     float temp, batt;
     uint16_t nid;
-    if (parseSensorMessage(text, temp, batt, nid)) {
+    uint8_t fwd_hops;
+    char fwd_path[48];
+    if (parseSensorMessage(text, temp, batt, nid, fwd_hops, fwd_path, sizeof(fwd_path))) {
       // For FLOOD: the path accumulates as the packet travels, so getPathHashCount() is
       // the hop count at arrival. For DIRECT: each repeater strips its hash before
       // forwarding (Mesh.cpp: removeSelfFromPath), so the arrived path is always 0.
       // Fall back to the stored outbound path length (symmetric route assumption).
       uint8_t hops;
       if (pkt->isRouteDirect() && from.out_path_len != OUT_PATH_UNKNOWN) {
-        hops = from.out_path_len;  // PATH_HASH_SIZE=1, so bytes == hops
+        hops = from.out_path_len;
       } else {
         hops = pkt->getPathHashCount();
       }
-      handleSensorData(from.name, temp, batt, nid, hops, pkt->isRouteDirect());
+      handleSensorData(from.name, temp, batt, nid, hops, fwd_hops, fwd_path,
+                       pkt->isRouteDirect());
     }
   }
 
@@ -491,7 +569,12 @@ public:
     last_recv_batt = 0;
     last_recv_node_id = 0;
     last_recv_hops = 0;
+    last_recv_fwd_hops = 0xFF;  // v2
+    last_recv_fwd_path[0] = 0;  // v2
     last_recv_direct = false;
+    // v2: zero out duplicate-detection LRU
+    memset(dup_cache, 0, sizeof(dup_cache));
+    dup_cache_next = 0;
   }
 
   const char* getNodeName() const { return _prefs.node_name; }
@@ -502,6 +585,7 @@ public:
   float getLastBatt() const { return last_recv_batt; }
   uint16_t getLastNodeId() const { return last_recv_node_id; }
   uint8_t getLastHops() const { return last_recv_hops; }
+  uint8_t getLastFwdHops() const { return last_recv_fwd_hops; }  // v2
   bool getLastDirect() const { return last_recv_direct; }
   const char* getLastFrom() const { return last_recv_from; }
   bool hasBayouKeys() const { return _prefs.bayou_public_key[0] != 0 && _prefs.bayou_private_key[0] != 0; }
@@ -675,9 +759,11 @@ public:
       Serial.printf("   WiFi: %s\n", wifi_status);
       Serial.printf("   Bayou: %s\n", last_post_status);
       if (has_recv) {
-        Serial.printf("   Last: from=%s node_id=%u temp=%.2fC batt=%.2fV radio_hops=%u route=%s\n",
+        Serial.printf("   Last: from=%s node_id=%u temp=%.2fC batt=%.2fV "
+                      "radio_hops=%u fwd_hops=%u fwd_path=%s route=%s\n",
                       last_recv_from, (unsigned)last_recv_node_id, last_recv_temp, last_recv_batt,
-                      (unsigned)last_recv_hops, last_recv_direct ? "DIRECT" : "FLOOD");
+                      (unsigned)last_recv_hops, (unsigned)last_recv_fwd_hops,
+                      last_recv_fwd_path, last_recv_direct ? "DIRECT" : "FLOOD");
       } else {
         Serial.println("   Last: no data received yet");
       }
@@ -738,7 +824,9 @@ public:
     unsigned long now = millis();
     if ((long)(now - next_post_retry_at) < 0) return;
 
-    if (postToBayou(last_recv_temp, last_recv_batt, last_recv_from, last_recv_node_id, last_recv_hops)) {
+    if (postToBayou(last_recv_temp, last_recv_batt, last_recv_from, last_recv_node_id,
+                    last_recv_hops, last_recv_fwd_hops, last_recv_fwd_path,
+                    last_recv_direct)) {
       post_pending = false;
     } else {
       next_post_retry_at = now + 15000;  // retry in 15 seconds

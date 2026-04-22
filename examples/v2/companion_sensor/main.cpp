@@ -21,7 +21,7 @@
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "companion_sensor v1 (build: Apr 2026)"
+#define FIRMWARE_VER_TEXT   "companion_sensor v2 (build: Apr 2026) [hop logging + timeout-invalidates-path]"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   910.525
@@ -124,6 +124,10 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   // Last send result for display feedback
   uint8_t last_send_successes;
   uint8_t last_send_attempts;
+
+  // v2: remember which target prefix was used for the most recent direct send,
+  // so onSendTimeout can invalidate its cached path. 0xFF = none pending.
+  uint8_t last_ack_target_idx;
 
   void loadContacts() {
     if (_fs->exists("/contacts")) {
@@ -389,10 +393,6 @@ public:
 
     updateSensorReadings();
 
-    char msg[128];
-    snprintf(msg, sizeof(msg), "[SENSOR] node_id=%u temp=%.2fC batt=%.2fV", (unsigned)node_id, last_temp, last_batt);
-    Serial.printf("   [SENSOR] %s\n", msg);
-
     for (uint8_t i = 0; i < target_count; i++) {
       last_send_attempts++;
 
@@ -404,7 +404,47 @@ public:
         continue;
       }
 
+      // v2: embed the sender's view of the forward path in the payload so the
+      // receiver can correlate with its measured arrival, and (new) identify the
+      // specific repeaters by hash byte. Format:
+      //   fwd_hops=N fwd_path=aa.bb.cc   (N = byte length of path)
+      //   fwd_hops=255 fwd_path=none     (path unknown, will flood)
+      uint8_t fwd_hops = (recipient->out_path_len == OUT_PATH_UNKNOWN) ? 255 : recipient->out_path_len;
+      char path_str[48];
+      if (recipient->out_path_len == OUT_PATH_UNKNOWN || recipient->out_path_len == 0) {
+        StrHelper::strncpy(path_str, "none", sizeof(path_str));
+      } else {
+        size_t off = 0;
+        // Cap at what fits in 47 chars: 15 hops × "xx." = 45 chars + "xx" = 47. Path_len max
+        // is 64 but in practice routes are short; we truncate defensively.
+        uint8_t to_write = recipient->out_path_len;
+        if (to_write > 15) to_write = 15;
+        for (uint8_t h = 0; h < to_write && off < sizeof(path_str) - 3; h++) {
+          int n = snprintf(path_str + off, sizeof(path_str) - off,
+                           h == 0 ? "%02x" : ".%02x", recipient->out_path[h]);
+          if (n < 0) break;
+          off += n;
+        }
+        path_str[sizeof(path_str) - 1] = 0;
+      }
+
+      char msg[200];
+      snprintf(msg, sizeof(msg),
+               "[SENSOR] node_id=%u temp=%.2fC batt=%.2fV fwd_hops=%u fwd_path=%s",
+               (unsigned)node_id, last_temp, last_batt, (unsigned)fwd_hops, path_str);
+      Serial.printf("   [SENSOR] %s\n", msg);
+
+      // v2: log the cached path bytes (not just length) before the send.
       Serial.printf("   -> %s: ", recipient->name);
+      if (recipient->out_path_len == OUT_PATH_UNKNOWN) {
+        Serial.print("(path UNKNOWN -> will FLOOD) ");
+      } else {
+        Serial.printf("(direct, len=%d, hashes=", recipient->out_path_len);
+        for (uint8_t h = 0; h < recipient->out_path_len; h++) {
+          Serial.printf("%02x%s", recipient->out_path[h], h < recipient->out_path_len - 1 ? "." : "");
+        }
+        Serial.print(") ");
+      }
 
       uint32_t est_timeout;
       int result = sendMessage(*recipient, getRTCClock()->getCurrentTime(), 0, msg, expected_ack_crc, est_timeout);
@@ -412,6 +452,7 @@ public:
         Serial.println("FAILED");
       } else {
         last_msg_sent = _ms->getMillis();
+        last_ack_target_idx = i;  // v2: remember target so onSendTimeout can invalidate
         Serial.println(result == MSG_SEND_SENT_FLOOD ? "sent (FLOOD)" : "sent (DIRECT)");
         last_send_successes++;
       }
@@ -500,7 +541,12 @@ protected:
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
-    Serial.printf("PATH to: %s, path_len=%d\n", contact.name, (uint32_t) contact.out_path_len);
+    // v2: log path bytes, not just length, so stale-path debugging is possible.
+    Serial.printf("PATH to: %s, path_len=%d, hashes=", contact.name, (uint32_t) contact.out_path_len);
+    for (uint8_t h = 0; h < contact.out_path_len; h++) {
+      Serial.printf("%02x%s", contact.out_path[h], h < contact.out_path_len - 1 ? "." : "");
+    }
+    Serial.println();
     saveContacts();
   }
 
@@ -543,6 +589,21 @@ protected:
   }
 
   void onSendTimeout() override {
+    // v2: on timeout, invalidate the cached out_path for the most recent target.
+    // The NEXT scheduled send will flood, which forces a fresh path discovery on
+    // both sides: the flood accumulates path hashes, and the receiver updates its
+    // own reverse out_path (which is what the ACK uses).
+    if (last_ack_target_idx < target_count) {
+      ContactInfo* c = lookupContactByPubKey(target_prefixes[last_ack_target_idx], TARGET_PREFIX_LEN);
+      if (c && c->out_path_len != OUT_PATH_UNKNOWN) {
+        Serial.printf("   ERROR: timed out, no ACK. Invalidating cached path to %s (was len=%d). Next send will FLOOD.\n",
+                      c->name, (int)c->out_path_len);
+        c->out_path_len = OUT_PATH_UNKNOWN;
+        saveContacts();
+        last_ack_target_idx = 0xFF;
+        return;
+      }
+    }
     Serial.println("   ERROR: timed out, no ACK.");
   }
 
@@ -560,6 +621,7 @@ public:
     last_send_time = 0;
     last_send_successes = 0;
     last_send_attempts = 0;
+    last_ack_target_idx = 0xFF;  // v2: no send pending
     node_id = 1;
   }
 

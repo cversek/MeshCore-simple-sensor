@@ -154,21 +154,34 @@ advert
 
 **Important:** Advertisement-based discovery shares contacts automatically, but it requires both nodes to hear each other's advertisement. For reliable setup, manual card exchange is recommended.
 
-## 5. Set the Sensor's Target
+## 5. Set the Sensor's Target(s)
 
-Tell the sensor which contact should receive readings:
+Tell the sensor which contact(s) should receive readings. The sensor supports up to **4 targets** — useful for range testing with a stationary and a mobile receiver.
 
+**Single target:**
 ```
 target FarmReceiver
 ```
 
-This does a prefix match, so `target Farm` would also work if there's only one match. Verify with:
+**Multiple targets:**
+```
+target add HomeReceiver
+target add MobileReceiver
+```
+
+Name matching is prefix-based. Verify with:
 
 ```
 target
 ```
 
-The target is saved to flash and persists across reboots.
+To remove or reset:
+```
+target remove HomeReceiver
+target clear
+```
+
+Targets are saved to flash. When `send` runs (manual or interval), the sensor sends the reading to all targets in sequence.
 
 ## 6. Configure the Receiver's WiFi
 
@@ -235,9 +248,9 @@ Or long-press the button on the "Send Sensor" display page.
 
 **Sensor serial:**
 ```
-[SENSOR] node_id=1 temp=22.50C batt=3.85V
-   Sending to FarmReceiver: [SENSOR] node_id=1 temp=22.50C batt=3.85V
-   (message sent - FLOOD)
+   [SENSOR] [SENSOR] node_id=1 temp=22.50C batt=3.85V
+   -> FarmReceiver: sent (FLOOD)
+   (1/1 sent)
    Got ACK! (round trip: 1234 millis)
 ```
 
@@ -245,7 +258,7 @@ Or long-press the button on the "Send Sensor" display page.
 ```
 (FLOOD) MSG from FarmSensor:
    [SENSOR] node_id=1 temp=22.50C batt=3.85V
-   [SENSOR DATA] from=FarmSensor node_id=1 temp=22.50C batt=3.85V
+   [SENSOR DATA] from=FarmSensor node_id=1 temp=22.50C batt=3.85V hops=2 route=FLOOD
    Posting to Bayou: https://bayou.pvos.org/data/your-public-key
    Bayou post OK (200): ...
 ```
@@ -324,7 +337,7 @@ Both displays auto-off after 30 seconds. Any button press wakes the display.
 [SENSOR] node_id=1 temp=22.50C batt=3.85V
 ```
 
-The receiver parses `node_id=`, `temp=` and `batt=` values from this format and posts them as JSON to Bayou:
+The receiver parses `node_id=`, `temp=` and `batt=` values from this format and posts them as JSON to Bayou, along with the packet hop count (useful for mesh health monitoring):
 
 ```json
 {
@@ -332,9 +345,12 @@ The receiver parses `node_id=`, `temp=` and `batt=` values from this format and 
   "node_id": 1,
   "temperature_c": 22.50,
   "battery_volts": 3.85,
+  "aux_1": 2,
   "source": "FarmSensor"
 }
 ```
+
+- `aux_1` — hop count (path hash count on the received packet)
 
 ## Serial Command Reference
 
@@ -344,10 +360,14 @@ The receiver parses `node_id=`, `temp=` and `batt=` values from this format and 
 |---------|-------------|
 | `card` | Show your biz card |
 | `import meshcore://...` | Import a contact |
-| `list` | List contacts |
-| `target <name>` | Set send target (prefix match) |
-| `target` | Show current target |
-| `to <name>` | Alias for `target` |
+| `list` | List contacts (shows `Contacts: N/MAX`) |
+| `purge` | Clear all stored contacts |
+| `target` | Show current targets |
+| `target add <name>` | Add a send target (max 4) |
+| `target remove <name>` | Remove a send target |
+| `target clear` | Clear all targets |
+| `target <name>` | Set to a single target (replaces all) |
+| `to <name>` | Alias for `target <name>` |
 | `send` | Send a reading now |
 | `set name <name>` | Set node name |
 | `set node_id <id>` | Set node ID (1-65535, default 1) |
@@ -362,8 +382,9 @@ The receiver parses `node_id=`, `temp=` and `batt=` values from this format and 
 |---------|-------------|
 | `card` | Show your biz card |
 | `import meshcore://...` | Import a contact |
-| `list` | List contacts |
-| `status` | Show WiFi, Bayou, last data |
+| `list` | List contacts (shows `Contacts: N/MAX`) |
+| `purge` | Clear all stored contacts |
+| `status` | Show contacts count, WiFi, Bayou, last data |
 | `set name <name>` | Set node name |
 | `set wifi_ssid <ssid>` | Set WiFi SSID (reboot to apply) |
 | `set wifi_password <pwd>` | Set WiFi password (reboot to apply) |
@@ -375,9 +396,9 @@ The receiver parses `node_id=`, `temp=` and `batt=` values from this format and 
 
 ## Troubleshooting
 
-**"No target set, skipping send"** — Run `target <name>` on the sensor to set the destination contact.
+**"No targets set, skipping send"** — Run `target add <name>` on the sensor to set at least one destination contact.
 
-**"Target contact not found"** — The target was set but the contact card hasn't been imported. Import the receiver's card on the sensor.
+**"skip: contact not found for prefix..."** — A target was set but the contact card isn't in the address book. Import the receiver's card on the sensor, or run `target remove <name>` / `target clear` to drop it.
 
 **"No DS18B20 found, using dummy value"** — Normal if no sensor is wired up. The firmware works with a dummy temperature of 99.9C for testing.
 
@@ -386,5 +407,7 @@ The receiver parses `node_id=`, `temp=` and `batt=` values from this format and 
 **"no wifi" / "WiFi: no SSID"** — Set `wifi_ssid` and `wifi_password` on the receiver and reboot.
 
 **Contact import shows "error: invalid format"** — Make sure you're pasting the full `meshcore://...` string including the prefix. Check that the hex string wasn't truncated during copy/paste.
+
+**Import says "ADVERT from -> Name" but `list` doesn't show the contact** — The contacts list is full. The firmware now auto-evicts the oldest non-favourite contact when full, but if all slots are held by favourites (or if you're on an older build), nothing new can be added. Check contact count with `list` or `status`, then `purge` to clear and re-import.
 
 **Commands show "ERROR: unknown command"** — If the first character is missing, this is a serial monitor quirk. Press ENTER once after connecting before typing commands.
