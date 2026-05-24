@@ -589,6 +589,12 @@ protected:
   }
 
   void onSendTimeout() override {
+    // If processAck already cleared expected_ack_crc, the ACK arrived just as the
+    // timeout fired — treat this as a late-but-no-op timeout and skip invalidation.
+    // Without this guard, a slow-but-successful FLOOD round-trip would invalidate
+    // the path we just learned from the receiver's PATH-return.
+    if (expected_ack_crc == 0) return;
+
     // v2: on timeout, invalidate the cached out_path for the most recent target.
     // The NEXT scheduled send will flood, which forces a fresh path discovery on
     // both sides: the flood accumulates path hashes, and the receiver updates its

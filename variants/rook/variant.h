@@ -74,7 +74,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 // Builtin buttons
 
-#define PIN_BUTTON1          (1)   // P0.06 — BUTTON_A
+#define PIN_BUTTON1          (6)   // P1.00 — BUTTON_A (Rook v4)
 #define BUTTON_PIN           PIN_BUTTON1
 
 
