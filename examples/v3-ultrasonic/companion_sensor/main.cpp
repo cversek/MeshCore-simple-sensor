@@ -18,7 +18,7 @@
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "companion_sensor v2-ultrasonic (build: May 2026) [MaxBotix MB7388 → distance_meters]"
+#define FIRMWARE_VER_TEXT   "companion_sensor v3-ultrasonic (build: May 2026) [v3 + MaxBotix MB7388 → distance_meters]"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   910.525
@@ -109,6 +109,15 @@ static float last_dist_m = 0;     // meters, parsed from MaxBotix
 static float last_batt = 0;
 static bool has_reading = false;
 
+// v3: last-send ACK status — surfaced on the OLED status page so a button-triggered
+// send shows whether the receiver actually acknowledged.
+enum AckStatus {
+  ACK_STATUS_NONE = 0,
+  ACK_STATUS_PENDING,
+  ACK_STATUS_OK,
+  ACK_STATUS_TIMEOUT
+};
+
 class MyMesh : public BaseChatMesh, ContactVisitor {
   FILESYSTEM* _fs;
   uint32_t expected_ack_crc;
@@ -134,6 +143,11 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   // v2: remember which target prefix was used for the most recent direct send,
   // so onSendTimeout can invalidate its cached path. 0xFF = none pending.
   uint8_t last_ack_target_idx;
+
+  // v3: ACK status of most recent send, displayed on OLED status page.
+  AckStatus last_ack_status;
+  uint32_t last_ack_rt_ms;            // round-trip ms of the most recent ACK (serial log only)
+  unsigned long last_ack_at_millis;   // millis() when the most recent OK ACK arrived
 
   void loadContacts() {
     if (_fs->exists("/contacts")) {
@@ -499,6 +513,7 @@ public:
       } else {
         last_msg_sent = _ms->getMillis();
         last_ack_target_idx = i;  // v2: remember target so onSendTimeout can invalidate
+        last_ack_status = ACK_STATUS_PENDING;
         Serial.println(result == MSG_SEND_SENT_FLOOD ? "sent (FLOOD)" : "sent (DIRECT)");
         last_send_successes++;
       }
@@ -525,6 +540,9 @@ public:
   uint8_t getTargetCount() const { return target_count; }
   uint8_t getLastSendSuccesses() const { return last_send_successes; }
   uint8_t getLastSendAttempts() const { return last_send_attempts; }
+  AckStatus getLastAckStatus() const { return last_ack_status; }
+  uint32_t getLastAckRoundTripMs() const { return last_ack_rt_ms; }
+  unsigned long getLastAckAtMillis() const { return last_ack_at_millis; }
 
   // Returns name of target at index, or NULL if not found.
   const char* getTargetName(uint8_t idx) {
@@ -598,7 +616,10 @@ protected:
 
   ContactInfo* processAck(const uint8_t *data) override {
     if (memcmp(data, &expected_ack_crc, 4) == 0) {
-      Serial.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
+      last_ack_rt_ms = _ms->getMillis() - last_msg_sent;
+      last_ack_at_millis = millis();
+      last_ack_status = ACK_STATUS_OK;
+      Serial.printf("   Got ACK! (round trip: %lu millis)\n", (unsigned long)last_ack_rt_ms);
       expected_ack_crc = 0;
       return NULL;
     }
@@ -640,6 +661,7 @@ protected:
     // Without this guard, a slow-but-successful FLOOD round-trip would invalidate
     // the path we just learned from the receiver's PATH-return.
     if (expected_ack_crc == 0) return;
+    last_ack_status = ACK_STATUS_TIMEOUT;
 
     // v2: on timeout, invalidate the cached out_path for the most recent target.
     // The NEXT scheduled send will flood, which forces a fresh path discovery on
@@ -674,6 +696,9 @@ public:
     last_send_successes = 0;
     last_send_attempts = 0;
     last_ack_target_idx = 0xFF;  // v2: no send pending
+    last_ack_status = ACK_STATUS_NONE;
+    last_ack_rt_ms = 0;
+    last_ack_at_millis = 0;
     node_id = 1;
   }
 
@@ -1019,8 +1044,34 @@ static void renderStatusPage(DisplayDriver& d) {
   d.setCursor(0, 46);
   d.print(buf);
 
-  // Interval
-  snprintf(buf, sizeof(buf), "Every %ds", (int)the_mesh.getSendInterval());
+  // v3: last ACK status. After a button-triggered send, this is the user's
+  // "did the receiver hear me?" feedback: sending… → ACK Xs/Xm/Xh ago / no ACK.
+  // Falls back to the send interval when no send has happened this boot.
+  switch (the_mesh.getLastAckStatus()) {
+    case ACK_STATUS_OK: {
+      unsigned long age_ms = millis() - the_mesh.getLastAckAtMillis();
+      unsigned long age_s = age_ms / 1000UL;
+      if (age_s < 60) {
+        snprintf(buf, sizeof(buf), "Last: ACK %lus ago", age_s);
+      } else if (age_s < 3600) {
+        snprintf(buf, sizeof(buf), "Last: ACK %lum ago", age_s / 60);
+      } else if (age_s < 86400) {
+        snprintf(buf, sizeof(buf), "Last: ACK %luh ago", age_s / 3600);
+      } else {
+        snprintf(buf, sizeof(buf), "Last: ACK %lud ago", age_s / 86400);
+      }
+      break;
+    }
+    case ACK_STATUS_PENDING:
+      snprintf(buf, sizeof(buf), "Last: sending...");
+      break;
+    case ACK_STATUS_TIMEOUT:
+      snprintf(buf, sizeof(buf), "Last: no ACK");
+      break;
+    default:
+      snprintf(buf, sizeof(buf), "Every %ds", (int)the_mesh.getSendInterval());
+      break;
+  }
   d.setCursor(0, 56);
   d.print(buf);
 }
@@ -1091,15 +1142,23 @@ static void handleButtonEvents() {
       the_mesh.sendSensorReading();
       uint8_t succ = the_mesh.getLastSendSuccesses();
       uint8_t att = the_mesh.getLastSendAttempts();
-      char alert[24];
       if (att == 0) {
-        snprintf(alert, sizeof(alert), "No targets");
-      } else if (succ == att) {
-        snprintf(alert, sizeof(alert), "Sent %d/%d", succ, att);
+        // No `target add …` has been done yet — make this very explicit.
+        showAlert("Target not set");
       } else {
-        snprintf(alert, sizeof(alert), "Sent %d/%d (partial)", succ, att);
+        // Switch to status page so the user can watch the "Last: …" line cycle
+        // through sending → ACK Nms / no ACK. Overlay a brief alert as immediate
+        // confirmation that the long-press registered.
+        current_page = PAGE_STATUS;
+        next_display_refresh = 0;
+        char alert[24];
+        if (succ == att) {
+          snprintf(alert, sizeof(alert), att == 1 ? "Sent" : "Sent %d/%d", succ, att);
+        } else {
+          snprintf(alert, sizeof(alert), "Sent %d/%d", succ, att);
+        }
+        showAlert(alert);
       }
-      showAlert(alert);
     } else if (current_page == PAGE_ADVERT) {
       if (the_mesh.sendAdvert()) {
         showAlert("Advert sent!");

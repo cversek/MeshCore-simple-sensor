@@ -23,7 +23,7 @@
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "companion_sensor_receiver v2-ultrasonic (build: May 2026) [distance_meters → Bayou]"
+#define FIRMWARE_VER_TEXT   "companion_sensor_receiver v3-ultrasonic (build: May 2026) [distance_meters → Bayou; same receiver as v2/v3, pair label only]"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   910.525

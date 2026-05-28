@@ -1,24 +1,25 @@
-# v2-ultrasonic — MaxBotix MB7388 → distance_meters → Bayou
+# v3-ultrasonic — v3 sensor + MaxBotix MB7388 → distance_meters → Bayou
 
-Fork of `examples/v2/` that swaps the DS18B20 temperature probe for a
+Fork of `examples/v3/` that swaps the DS18B20 temperature probe for a
 **MaxBotix MB7388 (HRXL-MaxSonar-WRMT)** ultrasonic rangefinder.
 Designed for dockside water-level monitoring: aim the sensor down at the
 water surface and log `distance_meters` to Bayou.
 
-Functionally identical to v2 on the LoRa side (hop logging,
-timeout-invalidates-path, ACK + path discovery). The only changes are the
-sensor read path on the Rook and the JSON field name on the receiver:
+Functionally identical to v3 on the LoRa side (hop logging,
+timeout-invalidates-path, ACK + path discovery) **and** carries v3's
+OLED last-ACK feedback (status page shows `Last: sending…` → `Last: ACK
+Xs ago` → `Last: no ACK` after a button-triggered send, plus the page
+flip to status + `Sent` alert and `Target not set` alert). The only
+changes vs v3 are the sensor read path on the Rook and the JSON field
+name on the receiver:
 
-| | v2 | v2-ultrasonic |
+| | v3 | v3-ultrasonic |
 |---|---|---|
 | Sensor probe | DS18B20 (OneWire) | MB7388 (Serial1, 9600 baud) |
 | Payload field | `temp=22.50C` | `dist=1.234m` |
 | Bayou JSON key | `temperature_c` | `distance_meters` |
 | OLED status line | `Temp: 22.5C` | `Dist: 1.23m` |
-
-The OLED on the sensor does **not** carry the v3 last-ACK feedback — this
-fork tracks v2 behavior on purpose, since the typical dock node will be
-left unattended.
+| OLED ACK feedback | yes | yes (carried over from v3) |
 
 ---
 
@@ -60,27 +61,38 @@ revision exposes it on a header pin.
 ### Wiring to Rook v4
 
 The MB7388's TTL serial output is 3.3 V logic, so it connects directly to
-the Rook's UART RX pin (no level shifter needed). The Rook variant
-already defines `PIN_SERIAL1_RX` (Arduino `Serial1` global) — use that
-pin. Refer to the Rook v4 silkscreen / pinout sheet for the physical pad.
+the Rook's UART RX pin (no level shifter needed). Only one wire is
+needed for data — the Rook never sends to the MB7388 in this build.
 
-Only one wire is needed for data (MB7388 pin 5 → Rook RX). The Rook never
-sends to the MB7388 in this build.
+| MaxBotix | Rook (schematic) | nRF52 | Arduino |
+|---|---|---|---|
+| pin 5 (TTL TX) | pin **2** — silkscreen `RX1` | P0.08 | D0 (`Serial1` RX) |
+| pin 6 (V+) | pin **21** — `3V3` | — | — |
+| pin 7 (GND) | any GND (3, 4, 23, 26) | — | — |
+| pin 4 (RX/strobe) | leave NC | — | — |
+
+See `notes/rook_v4_pinmap.md` for the full Rook v4 pin map (including
+the D0/D1 swap vs canonical Nice Nano — the silkscreen labels `TX0`/`RX1`
+do **not** correspond to Arduino digital pins 0/1).
+
+For longer-range performance the manufacturer recommends 4.5–5.0 V on
+pin 6 — tap the `BAT` pad (schematic pin 24/25 ≈ VBUS when USB-powered)
+instead of `3V3`.
 
 ---
 
 ## Build
 
 ```bash
-pio run -e Rook_companion_sensor_v2_ultrasonic           # sensor (Rook v4)
-pio run -e heltec_v4_companion_sensor_receiver_v2_ultrasonic  # receiver (Heltec V4)
+pio run -e Rook_companion_sensor_v3_ultrasonic           # sensor (Rook v4)
+pio run -e heltec_v4_companion_sensor_receiver_v3_ultrasonic  # receiver (Heltec V4)
 ```
 
 Flash:
 
 ```bash
-pio run -e Rook_companion_sensor_v2_ultrasonic -t upload
-pio run -e heltec_v4_companion_sensor_receiver_v2_ultrasonic -t upload
+pio run -e Rook_companion_sensor_v3_ultrasonic -t upload
+pio run -e heltec_v4_companion_sensor_receiver_v3_ultrasonic -t upload
 ```
 
 Approx. flash usage: Rook sensor ~376 KB / 815 KB (46%), Heltec receiver
@@ -88,21 +100,23 @@ Approx. flash usage: Rook sensor ~376 KB / 815 KB (46%), Heltec receiver
 
 ### PlatformIO env definitions
 
-- Rook sensor env: `[env:Rook_companion_sensor_v2_ultrasonic]` in
+- Rook sensor env: `[env:Rook_companion_sensor_v3_ultrasonic]` in
   `variants/rook/platformio.ini`
-- Heltec receiver env: `[env:heltec_v4_companion_sensor_receiver_v2_ultrasonic]`
+- Heltec receiver env: `[env:heltec_v4_companion_sensor_receiver_v3_ultrasonic]`
   in `variants/heltec_v4/platformio.ini`
 
 The Rook env drops the DS18B20 libs (`OneWire`, `DallasTemperature`) and
-the `ONEWIRE_PIN` define. Otherwise it mirrors `Rook_companion_sensor_v2`.
+the `ONEWIRE_PIN` define. Otherwise it mirrors the standard v2/v3 sensor
+envs.
 
 ---
 
 ## Setup (after flashing)
 
-Both nodes still share the same v2 radio settings and CLI. See
-`examples/v2/companion_sensor/README.md` for the full CLI walkthrough.
-Same shape as v2 — only the displayed field changes.
+Both nodes share the same radio settings and CLI as v2/v3. See
+`firmware/2026-05-26/README.md` (the v3 build notes) for the full CLI
+walkthrough — the command set is identical here, only the displayed
+field changes.
 
 ### Bayou setup
 
@@ -134,7 +148,7 @@ dock node needs charging.
 On the Rook serial console:
 
 ```
-ver               # should print "companion_sensor v2-ultrasonic ..."
+ver               # should print "companion_sensor v3-ultrasonic ..."
 send              # forces a reading + send; serial trace should show
                   # "[SENSOR] node_id=N dist=X.XXXm batt=Y.YYV ..."
 ```
