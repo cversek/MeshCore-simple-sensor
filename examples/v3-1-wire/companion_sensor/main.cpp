@@ -16,9 +16,12 @@
 #include <RTClib.h>
 #include <target.h>
 
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "companion_sensor v3-ultrasonic (build: May 2026) [v3 + MaxBotix MB7388 → distance_meters]"
+#define FIRMWARE_VER_TEXT   "companion_sensor v3-1-wire (build: June 2026) [v3-ultrasonic UX + DS18B20 OneWire → temperature_c]"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   910.525
@@ -40,14 +43,9 @@
   #define MAX_CONTACTS   32
 #endif
 
-#ifndef ULTRASONIC_BAUD
-  #define ULTRASONIC_BAUD  9600
-#endif
-
-// How long to wait for a fresh MaxBotix frame (continuous mode is ~6 Hz, so
-// any wait > ~170 ms should hit at least one frame).
-#ifndef ULTRASONIC_READ_TIMEOUT_MS
-  #define ULTRASONIC_READ_TIMEOUT_MS  400
+#ifndef ONEWIRE_PIN
+  // Default = Arduino D9 = P1.06 = Rook v4 schematic pin 12.
+  #define ONEWIRE_PIN  9
 #endif
 
 #ifndef ADVERT_NAME
@@ -73,7 +71,7 @@
 /* ---------------------------------- DISPLAY PAGES ------------------------------------- */
 
 enum DisplayPage {
-  PAGE_STATUS = 0,   // Shows distance, battery, target, interval
+  PAGE_STATUS = 0,   // Shows temperature, battery, target, interval
   PAGE_SEND,         // "Send sensor" -- long press to send
   PAGE_ADVERT,       // "Send advert" -- long press to broadcast
   PAGE_COUNT
@@ -96,16 +94,13 @@ static uint32_t _atoi(const char* sp) {
 
 /* -------------------------------------------------------------------------------------- */
 
-// MaxBotix MB7388 sensor globals.
-// Reads ASCII frames of the form "Rxxxx\r" on Serial1 (9600 baud, TTL).
-// MB7388 free-runs at ~6 Hz when its pin 4 (RX/strobe) is left floating or HIGH.
-// xxxx is millimeters; range 300 mm – 5000 mm. 0 / out-of-range readings are
-// reported by the sensor itself (e.g. "R5000" for max-out).
+// DS18B20 sensor globals (OneWire bus on ONEWIRE_PIN, default Arduino D9 = P1.06).
+static OneWire oneWire(ONEWIRE_PIN);
+static DallasTemperature ds18b20(&oneWire);
 static bool has_sensor = false;
-static unsigned long sensor_last_frame_at = 0;
 
 // Cached sensor readings (updated each send interval)
-static float last_dist_m = 0;     // meters, parsed from MaxBotix
+static float last_temp = 0;       // Celsius, from DS18B20
 static float last_batt = 0;
 static bool has_reading = false;
 
@@ -376,48 +371,17 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     Serial.println("   error: invalid format");
   }
 
-  // Drain Serial1 looking for the most recent complete MaxBotix frame
-  // ("Rdddd\r"). Returns distance in meters, or -1.0 on no-frame / parse error.
-  // We loop until ULTRASONIC_READ_TIMEOUT_MS elapses to make sure the value
-  // we return is the freshest one in the buffer.
-  float readDistanceMeters() {
-    int last_mm = -1;
-    char digits[8];
-    int di = 0;
-    bool capturing = false;
-
-    unsigned long start = millis();
-    while ((millis() - start) < ULTRASONIC_READ_TIMEOUT_MS) {
-      while (Serial1.available()) {
-        char c = (char)Serial1.read();
-        if (c == 'R') {
-          capturing = true;
-          di = 0;
-        } else if (capturing) {
-          if (c == '\r') {
-            digits[di] = 0;
-            if (di >= 3) {  // accept 3 or 4 digit frames
-              last_mm = atoi(digits);
-              sensor_last_frame_at = millis();
-            }
-            capturing = false;
-            di = 0;
-          } else if (di < (int)sizeof(digits) - 1 && c >= '0' && c <= '9') {
-            digits[di++] = c;
-          } else {
-            capturing = false;
-            di = 0;
-          }
-        }
-      }
-      delay(5);
+  // Read DS18B20 over OneWire. Blocks for ~750 ms (12-bit resolution conversion).
+  // Returns NaN if no probe is on the bus or the reading is the DallasTemperature
+  // sentinel "device disconnected" value.
+  float readTemperatureC() {
+    ds18b20.requestTemperatures();
+    float t = ds18b20.getTempCByIndex(0);
+    if (t == DEVICE_DISCONNECTED_C) {
+      Serial.println("   DS18B20: device disconnected");
+      return NAN;
     }
-
-    if (last_mm < 0) {
-      Serial.println("   MaxBotix: no frame within timeout");
-      return -1.0f;
-    }
-    return (float)last_mm / 1000.0f;
+    return t;
   }
 
   float readBatteryVoltage() {
@@ -426,13 +390,13 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   }
 
   void updateSensorReadings() {
-    float d = readDistanceMeters();
-    if (d >= 0.0f) {
-      last_dist_m = d;
+    float t = readTemperatureC();
+    if (!isnan(t)) {
+      last_temp = t;
       has_sensor = true;
       has_reading = true;
     } else {
-      // No fresh frame this cycle. Keep prior last_dist_m so display still
+      // No fresh reading this cycle. Keep prior last_temp so display still
       // shows a value, but flag has_sensor=false so payload tags it as stale.
       has_sensor = false;
       has_reading = true;  // still send so receiver knows we're alive
@@ -475,8 +439,6 @@ public:
         StrHelper::strncpy(path_str, "none", sizeof(path_str));
       } else {
         size_t off = 0;
-        // Cap at what fits in 47 chars: 15 hops × "xx." = 45 chars + "xx" = 47. Path_len max
-        // is 64 but in practice routes are short; we truncate defensively.
         uint8_t to_write = recipient->out_path_len;
         if (to_write > 15) to_write = 15;
         for (uint8_t h = 0; h < to_write && off < sizeof(path_str) - 3; h++) {
@@ -490,11 +452,10 @@ public:
 
       char msg[200];
       snprintf(msg, sizeof(msg),
-               "[SENSOR] node_id=%u dist=%.3fm batt=%.2fV fwd_hops=%u fwd_path=%s",
-               (unsigned)node_id, last_dist_m, last_batt, (unsigned)fwd_hops, path_str);
+               "[SENSOR] node_id=%u temp=%.2fC batt=%.2fV fwd_hops=%u fwd_path=%s",
+               (unsigned)node_id, last_temp, last_batt, (unsigned)fwd_hops, path_str);
       Serial.printf("   [SENSOR] %s\n", msg);
 
-      // v2: log the cached path bytes (not just length) before the send.
       Serial.printf("   -> %s: ", recipient->name);
       if (recipient->out_path_len == OUT_PATH_UNKNOWN) {
         Serial.print("(path UNKNOWN -> will FLOOD) ");
@@ -512,7 +473,7 @@ public:
         Serial.println("FAILED");
       } else {
         last_msg_sent = _ms->getMillis();
-        last_ack_target_idx = i;  // v2: remember target so onSendTimeout can invalidate
+        last_ack_target_idx = i;
         last_ack_status = ACK_STATUS_PENDING;
         Serial.println(result == MSG_SEND_SENT_FLOOD ? "sent (FLOOD)" : "sent (DIRECT)");
         last_send_successes++;
@@ -546,7 +507,7 @@ public:
 
   // Read the sensor + battery and cache the values WITHOUT sending — used by
   // the OLED's Send page so the user can see a fresh reading before deciding
-  // to long-press send. Blocks for up to ULTRASONIC_READ_TIMEOUT_MS.
+  // to long-press send. Blocks for ~750 ms (DS18B20 conversion).
   void refreshReading() { updateSensorReadings(); }
 
   // Returns name of target at index, or NULL if not found.
@@ -610,7 +571,6 @@ protected:
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
-    // v2: log path bytes, not just length, so stale-path debugging is possible.
     Serial.printf("PATH to: %s, path_len=%d, hashes=", contact.name, (uint32_t) contact.out_path_len);
     for (uint8_t h = 0; h < contact.out_path_len; h++) {
       Serial.printf("%02x%s", contact.out_path[h], h < contact.out_path_len - 1 ? "." : "");
@@ -661,17 +621,9 @@ protected:
   }
 
   void onSendTimeout() override {
-    // If processAck already cleared expected_ack_crc, the ACK arrived just as the
-    // timeout fired — treat this as a late-but-no-op timeout and skip invalidation.
-    // Without this guard, a slow-but-successful FLOOD round-trip would invalidate
-    // the path we just learned from the receiver's PATH-return.
     if (expected_ack_crc == 0) return;
     last_ack_status = ACK_STATUS_TIMEOUT;
 
-    // v2: on timeout, invalidate the cached out_path for the most recent target.
-    // The NEXT scheduled send will flood, which forces a fresh path discovery on
-    // both sides: the flood accumulates path hashes, and the receiver updates its
-    // own reverse out_path (which is what the ACK uses).
     if (last_ack_target_idx < target_count) {
       ContactInfo* c = lookupContactByPubKey(target_prefixes[last_ack_target_idx], TARGET_PREFIX_LEN);
       if (c && c->out_path_len != OUT_PATH_UNKNOWN) {
@@ -700,7 +652,7 @@ public:
     last_send_time = 0;
     last_send_successes = 0;
     last_send_attempts = 0;
-    last_ack_target_idx = 0xFF;  // v2: no send pending
+    last_ack_target_idx = 0xFF;
     last_ack_status = ACK_STATUS_NONE;
     last_ack_rt_ms = 0;
     last_ack_at_millis = 0;
@@ -752,7 +704,7 @@ public:
     if (has_sensor) {
       Serial.println("DS18B20: detected");
     } else {
-      Serial.println("DS18B20: not found (using dummy value 99.9C)");
+      Serial.println("DS18B20: not found");
     }
 
     if (target_count > 0) {
@@ -812,7 +764,6 @@ public:
       saveTargets();
       Serial.println("   All targets cleared.");
     } else if (memcmp(command, "target ", 7) == 0) {
-      // Legacy: `target <name>` replaces all targets with just this one
       const char* name = &command[7];
       ContactInfo* contact = searchContactsByPrefix(name);
       if (contact) {
@@ -855,7 +806,6 @@ public:
       saveContacts();
       Serial.printf("   Purged %d contacts (0/%d now)\n", before, MAX_CONTACTS);
     } else if (memcmp(command, "to ", 3) == 0) {
-      // Alias for `target <name>` (replace all)
       const char* name = &command[3];
       ContactInfo* contact = searchContactsByPrefix(name);
       if (contact) {
@@ -943,7 +893,7 @@ public:
     uint32_t now = getRTCClock()->getCurrentTime();
     if (now > 0 && (last_send_time == 0 || (now - last_send_time) >= send_interval_secs)) {
       updateSensorReadings();
-      Serial.printf("[SENSOR] node_id=%u dist=%.3fm batt=%.2fV\n", (unsigned)node_id, last_dist_m, last_batt);
+      Serial.printf("[SENSOR] node_id=%u temp=%.2fC batt=%.2fV\n", (unsigned)node_id, last_temp, last_batt);
       sendSensorReading();
       last_send_time = now;
     }
@@ -1016,13 +966,11 @@ static void renderStatusPage(DisplayDriver& d) {
   d.setCursor(0, 10);
   d.print(buf);
 
-  // Distance (water-level when mounted pointing down)
-  if (!has_sensor) {
-    snprintf(buf, sizeof(buf), "Sensor: NOT DETECTED");
-  } else if (has_reading) {
-    snprintf(buf, sizeof(buf), "Dist: %.2fm", last_dist_m);
+  // Temperature
+  if (has_reading) {
+    snprintf(buf, sizeof(buf), "Temp: %.1fC%s", last_temp, has_sensor ? "" : " (stale)");
   } else {
-    snprintf(buf, sizeof(buf), "Dist: --");
+    snprintf(buf, sizeof(buf), "Temp: --");
   }
   d.setCursor(0, 22);
   d.print(buf);
@@ -1091,12 +1039,10 @@ static void renderSendPage(DisplayDriver& d) {
   // Live preview: refreshed on page-arrival via refreshReading(). Shows the
   // user what would actually go out if they long-press now.
   char buf[24];
-  if (!has_sensor) {
-    snprintf(buf, sizeof(buf), "Sensor: NOT DETECTED");
-  } else if (has_reading) {
-    snprintf(buf, sizeof(buf), "Dist: %.2fm", last_dist_m);
+  if (has_reading) {
+    snprintf(buf, sizeof(buf), "Temp: %.1fC%s", last_temp, has_sensor ? "" : " (stale)");
   } else {
-    snprintf(buf, sizeof(buf), "Dist: --");
+    snprintf(buf, sizeof(buf), "Temp: --");
   }
   d.drawTextCentered(d.width() / 2, 28, buf);
 
@@ -1173,12 +1119,8 @@ static void handleButtonEvents() {
       uint8_t succ = the_mesh.getLastSendSuccesses();
       uint8_t att = the_mesh.getLastSendAttempts();
       if (att == 0) {
-        // No `target add …` has been done yet — make this very explicit.
         showAlert("Target not set");
       } else {
-        // Switch to status page so the user can watch the "Last: …" line cycle
-        // through sending → ACK Nms / no ACK. Overlay a brief alert as immediate
-        // confirmation that the long-press registered.
         current_page = PAGE_STATUS;
         next_display_refresh = 0;
         char alert[24];
@@ -1241,38 +1183,16 @@ void setup() {
 
   fast_rng.begin(radio_get_rng_seed());
 
-  // Initialize MaxBotix MB7388 (TTL serial, 9600 baud, "Rxxxx\r" frames).
-  // Wire the MaxBotix pin 5 (serial TX) to the Rook's Serial1 RX pin; no TX
-  // wire back is needed. Power: 3.0–5.5 V on pin 6, ground on pin 7.
-  Serial.println("setup: probing MaxBotix on Serial1 @ 9600 baud...");
-  Serial1.begin(ULTRASONIC_BAUD);
-  // Give the sensor up to ~500 ms to emit a first frame so we can flag
-  // has_sensor on the OLED. has_sensor will be re-asserted on every successful
-  // updateSensorReadings() anyway.
-  {
-    unsigned long start = millis();
-    bool got = false;
-    bool capturing = false;
-    int di = 0;
-    while ((millis() - start) < 500 && !got) {
-      while (Serial1.available()) {
-        char c = (char)Serial1.read();
-        if (c == 'R') { capturing = true; di = 0; }
-        else if (capturing) {
-          if (c == '\r' && di >= 3) { got = true; break; }
-          if (c >= '0' && c <= '9') di++;
-          else { capturing = false; di = 0; }
-        }
-      }
-      delay(5);
-    }
-    if (got) {
-      has_sensor = true;
-      Serial.println("MaxBotix MB7388 detected on Serial1.");
-    } else {
-      has_sensor = false;
-      Serial.println("No MaxBotix frames on Serial1 (check wiring / 9600 baud).");
-    }
+  // Initialize DS18B20 on the OneWire bus (default Arduino D9 = P1.06).
+  Serial.printf("setup: probing DS18B20 on OneWire pin %d...\n", ONEWIRE_PIN);
+  ds18b20.begin();
+  int devices = ds18b20.getDeviceCount();
+  if (devices > 0) {
+    has_sensor = true;
+    Serial.printf("DS18B20 detected (%d device%s on bus).\n", devices, devices == 1 ? "" : "s");
+  } else {
+    has_sensor = false;
+    Serial.println("No DS18B20 on OneWire bus (check wiring / 4.7k pull-up between data and 3V3).");
   }
 
 #ifdef DISPLAY_CLASS
