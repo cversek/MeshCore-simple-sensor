@@ -84,12 +84,34 @@ static inline void radio_pin_silence(uint32_t arduino_pin) {
 }
 #endif
 
+// SLEEP_RADIO_SEQ_FIX: enter sleep via standby -> clear IRQs -> sleep(warm),
+// then park the RF switch and chip-select for the sleep window.
+//
+// The bare radio.sleep() below is issued straight from continuous Rx after
+// TX/ACK traffic. RadioLib #1736 (measured on this same nRF52840 + Wio-SX1262
+// combo) shows a pending radio interrupt at SetSleep can strand the die in
+// STANDBY: 600 uA (RC) / 800 uA (XOSC) instead of ~1 uA -- which would account
+// for most of our 1.06 mA floor by itself. Also per the module docs: RF_SW held
+// high costs +55 uA, and NSS must stay a DRIVEN HIGH (a floating NSS measures
+// 2.2 mA). Wake path is unchanged: standby() + startReceive(), the proven arc.
+#ifndef SLEEP_RADIO_SEQ_FIX
+#define SLEEP_RADIO_SEQ_FIX 0
+#endif
+
 static bool g_radio_slept = false;
 
 // SPI-sleep the radio (~1 uA). Caller must then stop servicing the mesh
 // (loop() gates on g_radio_slept) until radio_wake_lp().
 static inline void radio_sleep_lp() {
+#if SLEEP_RADIO_SEQ_FIX
+  radio.standby();              // leave Rx cleanly before sleeping
+  radio.clearIrqStatus();       // clear ALL pending radio IRQs so SetSleep sticks
+  radio.sleep(true);            // warm sleep, config retained
+  digitalWrite(SX126X_RXEN, LOW);       // RF switch off for the window (+55 uA if left high)
+  digitalWrite(P_LORA_NSS, HIGH);       // chip-select parked driven-HIGH, never floating
+#else
   radio.sleep();                // SX126x SetSleep (warm: config + DIO retained)
+#endif
 #if SLEEP_RADIO_POWER_OFF
 #if SLEEP_RADIO_TRISTATE
   // Stop driving anything into the chip BEFORE removing its supply, or the MCU
