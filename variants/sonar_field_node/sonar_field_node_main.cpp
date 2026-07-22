@@ -1,4 +1,5 @@
 #include <Arduino.h>   // needed for PlatformIO
+#include <Wire.h>      // TWI handle, so sleep can release the bus (SLEEP_RELEASE_TWI)
 #include <Mesh.h>
 
 #if defined(NRF52_PLATFORM)
@@ -85,6 +86,202 @@ enum DisplayPage {
 #define DISPLAY_AUTO_OFF_MS   30000
 #define LONG_PRESS_MILLIS     1200
 #define ALERT_DURATION_MS     1500
+
+// MB7388 pin 4 (Ranging Start/Stop) wired to Arduino D1 = P0.06, reclaimed from
+// Serial1 TX (no TX wire needed). Commanded ranging: hold high to range, low to
+// stop. Serial1.begin() otherwise owns D1 as UART TXD idling HIGH -> the sensor
+// free-runs and backlogs unsolicited frames, so setup() detaches TXD via PSEL.
+#define PIN_STROBE   1
+#ifndef SONAR_SAMPLES
+#define SONAR_SAMPLES  7   // frames to collect per reading; median rejects surface chop
+#endif
+
+// --- power knobs, each separately measurable ------------------------------------
+// Default 0 so the default build stays exactly the configuration measured at
+// 1.066 mA on 2026-07-18. Each gets its own env so its effect is attributable
+// before it is adopted: measure first, then make it the default.
+//
+// PWR_ENABLE_DCDC: RookBoard derives from NRF52BoardDCDC, but RookBoard::begin()
+// calls NRF52Board::begin() -- the GRANDparent -- so NRF52BoardDCDC::begin() never
+// runs and the DC/DC enable is silently skipped. The board has been running on the
+// LDO. Enabling DC/DC on an nRF52840 typically saves 30-40% of supply current.
+// Done app-side rather than by patching Don's RookBoard.cpp; worth reporting
+// upstream as a board-support bug either way.
+#ifndef PWR_ENABLE_DCDC
+#define PWR_ENABLE_DCDC 0
+#endif
+
+// SLEEP_RELEASE_TWI: Wire.begin() runs once in RookBoard::begin() and is never
+// ended, so TWIM stays enabled across sleep. Same class of leak as the UART.
+#ifndef SLEEP_RELEASE_TWI
+#define SLEEP_RELEASE_TWI 0
+#endif
+
+// Compile knob for the attribution A/B. 1 (default) releases UARTE0 across sleep;
+// 0 leaves it enabled the way the pre-2026-07-18 firmware did, which is what the
+// measured 6.6 mA floor came from. Build the paired env to reproduce that arm
+// rather than passing an ephemeral -D, so the comparison stays replicable.
+#ifndef SLEEP_RELEASE_UART
+#define SLEEP_RELEASE_UART 1
+#endif
+
+// SLEEP_PIN_DISCONNECT_AUDIT: during sleep, put the explicitly listed non-radio
+// pins into the nRF52's buffer-disconnected reset state (PIN_CNF INPUT=Disconnect
+// via nrf_gpio_cfg_default) instead of whatever floating/input state the sleep
+// path leaves them in. pinMode(INPUT) keeps the input buffer connected, and a
+// floating buffer near threshold conducts. Restore contract: each pin's own
+// bring-up in MODE_WAKE rewrites its PIN_CNF (sonar_serial_begin -> strobe
+// OUTPUT + Serial1 RX; Wire.begin -> SDA/SCL), so no explicit reconnect step
+// exists to forget. The list is closed-form on purpose -- only pins whose wake
+// path provably reconfigures them. Sonar gate (D5/P0.24) stays a driven OUTPUT.
+#ifndef SLEEP_PIN_DISCONNECT_AUDIT
+#define SLEEP_PIN_DISCONNECT_AUDIT 0
+#endif
+
+// SLEEP_DISABLE_USBD: turn the USB peripheral off during battery sleep.
+//
+// The Adafruit core calls TinyUSB_Device_Init unconditionally, so USBD stays
+// enabled on battery with no host attached. An enabled USBD holds the HFCLK and
+// is the classic signature of a ~1 mA nRF52840 sleep floor. Only fires when
+// USBREGSTATUS reports no VBUS, so every USB-attached bench flow is untouched.
+// One-way on battery: replugging USB later needs a reset to re-enumerate --
+// acceptable for a field node, and stated wherever this knob gets adopted.
+#ifndef SLEEP_DISABLE_USBD
+#define SLEEP_DISABLE_USBD 0
+#endif
+
+// SLEEP_FPU_CLEAR: apply the nRF52840 Errata-87 workaround before each sleep
+// poll. Float math latches an FPSCR exception bit which keeps the FPU IRQ
+// pending; a pending IRQ makes WFE fall straight through, so the FreeRTOS idle
+// task spins instead of sleeping. QT1 (2026-07-20) measured fpu_pend=1 at
+// every sleep entry on this firmware, so this is live, not theoretical.
+#ifndef SLEEP_FPU_CLEAR
+#define SLEEP_FPU_CLEAR 0
+#endif
+
+// --- bisection strip knobs (cumulative, app layer only) ---
+// Each STRIP_* removes one stack layer so adjacent JS220 floors attribute its
+// cost. Ladder: S1 display -> S2 sonar -> S3 filesystem -> S4 mesh (radio goes
+// RadioLib-direct: init then immediate warm sleep; loop is a bare heartbeat).
+// All default 0 -- the deployment build is untouched.
+#ifndef STRIP_DISPLAY
+#define STRIP_DISPLAY 0
+#endif
+#ifndef STRIP_SONAR
+#define STRIP_SONAR 0
+#endif
+#ifndef STRIP_FS
+#define STRIP_FS 0
+#endif
+#ifndef STRIP_MESH
+#define STRIP_MESH 0
+#endif
+// HEARTBEAT: '[HB] <millis>' each sleep poll -- the alive-check for stripped
+// arms that cannot TX/ACK.
+#ifndef HEARTBEAT
+#define HEARTBEAT 0
+#endif
+
+#if STRIP_DISPLAY
+// turnOn() re-inits the panel (SSD1306Display.cpp:24), so a begin() guard alone
+// is not enough -- stub the on/off calls at their sites.
+#define DISPLAY_TURN_ON()  ((void)0)
+#define DISPLAY_TURN_OFF() ((void)0)
+#else
+#define DISPLAY_TURN_ON()  display.turnOn()
+#define DISPLAY_TURN_OFF() display.turnOff()
+#endif
+
+// SLEEP_HFCLK_STOP: stop the HFXO during battery sleep. QT1 showed the 64 MHz
+// crystal RUNNING through sleep; disabling USBD alone did not release it.
+// Suspected mechanism: the node always boots on USB, the USB bring-up requests
+// HFCLK, and nothing releases the request when VBUS goes away mid-run -- the
+// release rides a power event no task processes on battery. Rather than chase
+// the requester, stop the clock at sleep entry when VBUS is absent. Peripherals
+// that need HF later fall back to HFINT on demand; the SX1262 runs its own
+// TCXO and does not care about the MCU crystal.
+#ifndef SLEEP_HFCLK_STOP
+#define SLEEP_HFCLK_STOP 0
+#endif
+
+// SLEEP_DIAG: print the power-relevant machine state at each sleep entry
+// (SoftDevice enabled? USBD enabled? HFCLK source+state? FPU IRQ pending?
+// RXEN/NSS levels). Costs a few ms of serial once per cycle; bench-only knob.
+#ifndef SLEEP_DIAG
+#define SLEEP_DIAG 0
+#endif
+
+#if SLEEP_DIAG
+static void sleep_diag_dump() {
+  // Boot-entry guard: the mode machine STARTS in MODE_SLEEP, so this runs in the
+  // first instants of boot -- and reading USBD registers before the USB power
+  // domain finishes sequencing bus-faults the core (node dies before CDC ever
+  // enumerates; cost us three invisible flashes). Skip the boot entry; the
+  // first informative dump is after a real wake/TX cycle anyway. Same reason
+  // there is no sd_softdevice_is_enabled() SVC here.
+  static bool first_entry = true;
+  if (first_entry) { first_entry = false; return; }
+  Serial.print("[DIAG] usbd_en="); Serial.print(NRF_USBD->ENABLE);
+  Serial.print(" vbus="); Serial.print((NRF_POWER->USBREGSTATUS & 1) ? 1 : 0);
+  Serial.print(" hfclkstat=0x"); Serial.print(NRF_CLOCK->HFCLKSTAT, HEX);
+  Serial.print(" fpu_pend="); Serial.print(NVIC_GetPendingIRQ(FPU_IRQn));
+  Serial.print(" rxen="); Serial.print(digitalRead(SX126X_RXEN));
+  Serial.print(" nss="); Serial.println(digitalRead(P_LORA_NSS));
+}
+#endif
+
+#if SLEEP_PIN_DISCONNECT_AUDIT
+#include "nrf_gpio.h"
+static void sleep_pins_disconnect() {
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_STROBE]);       // D1/P0.06: sonar_serial_end left it INPUT (buffer on)
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_SERIAL1_RX]);   // D0/P0.08: sonar RX pad after UARTE release
+#if SLEEP_RELEASE_TWI
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_WIRE_SDA]);     // I2C pads only when TWIM is truly ended
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_WIRE_SCL]);
+#endif
+}
+#endif
+
+// --- sonar serial lifecycle (deep-idle support) --------------------------------
+// UARTE0 is a power domain of its own: left enabled it holds the HFCLK running and
+// costs on the order of a milliamp even with no traffic, which puts a floor under
+// any System-ON idle. So the sleep path must DISABLE it, not merely stop reading.
+//
+// Every Serial1.begin() re-attaches UARTE TXD to D1, so the PSEL detach has to be
+// re-applied here on each bring-up or the sensor free-runs and backlogs unsolicited
+// frames (an earlier bug). Keeping both halves in one place is what stops the
+// wake path from silently forgetting it.
+static void sonar_serial_begin() {
+#if STRIP_SONAR
+  return;                              // bisection arm: sonar layer removed
+#endif
+  Serial1.begin(ULTRASONIC_BAUD);
+  NRF_UARTE0->PSEL.TXD = 0xFFFFFFFF;   // reclaim D1 from UART TX -> GPIO strobe
+  pinMode(PIN_STROBE, OUTPUT);
+  digitalWrite(PIN_STROBE, LOW);       // ranging stopped until a read commands it
+}
+
+// Release UARTE0 and both sonar pads. Called BEFORE gating the sensor off: an
+// active UART RX pad sneak-loads the MB7388's output while its ground floats,
+// which is the loading path chased earlier.
+static void sonar_serial_end() {
+#if STRIP_SONAR
+  return;                              // bisection arm: sonar layer removed
+#endif
+  Serial1.end();
+  NRF_UARTE0->ENABLE = 0;              // ensure the peripheral is truly off, not idle
+  pinMode(PIN_STROBE, INPUT);          // hi-Z: never drive into an unpowered sensor
+}
+
+// median of the first n ints in a[] (n small; insertion sort in place)
+static int median_int(int *a, int n) {
+  for (int i = 1; i < n; i++) {
+    int v = a[i], j = i - 1;
+    while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
+    a[j + 1] = v;
+  }
+  return a[n / 2];
+}
 
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
@@ -399,13 +596,21 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   // We loop until ULTRASONIC_READ_TIMEOUT_MS elapses to make sure the value
   // we return is the freshest one in the buffer.
   float readDistanceMeters() {
-    int last_mm = -1;
+    // Commanded ranging: flush, strobe pin4 high, collect up to SONAR_SAMPLES
+    // "Rdddd\r" frames, strobe low, return their median (mm -> m). Commanding
+    // the strobe (vs floating pin4) is what keeps the MB7388 from free-running
+    // and backlogging unsolicited frames when Serial1 shares the pin.
+    while (Serial1.available()) Serial1.read();          // drop stale frames
+    digitalWrite(PIN_STROBE, HIGH);                       // pin4 high -> ranging
+
+    int samp[SONAR_SAMPLES];
+    int ns = 0;
     char digits[8];
     int di = 0;
     bool capturing = false;
-
-    unsigned long start = millis();
-    while ((millis() - start) < ULTRASONIC_READ_TIMEOUT_MS) {
+    // ~6 Hz frames, so give ~200 ms each plus a settle margin
+    unsigned long deadline = millis() + (unsigned long)SONAR_SAMPLES * 200UL + 300UL;
+    while (ns < SONAR_SAMPLES && (long)(deadline - millis()) > 0) {
       while (Serial1.available()) {
         char c = (char)Serial1.read();
         if (c == 'R') {
@@ -415,8 +620,9 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
           if (c == '\r') {
             digits[di] = 0;
             if (di >= 3) {  // accept 3 or 4 digit frames
-              last_mm = atoi(digits);
+              samp[ns++] = atoi(digits);
               sensor_last_frame_at = millis();
+              if (ns >= SONAR_SAMPLES) break;
             }
             capturing = false;
             di = 0;
@@ -428,14 +634,16 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
           }
         }
       }
-      delay(5);
+      delay(2);
     }
 
-    if (last_mm < 0) {
+    digitalWrite(PIN_STROBE, LOW);                        // pin4 low -> stop ranging
+
+    if (ns == 0) {
       Serial.println("   MaxBotix: no frame within timeout");
       return -1.0f;
     }
-    return (float)last_mm / 1000.0f;
+    return (float)median_int(samp, ns) / 1000.0f;
   }
 
   float readBatteryVoltage() {
@@ -1196,7 +1404,7 @@ static void handleButtonEvents() {
   // Any button press turns display on and resets auto-off timer
   last_button_activity = millis();
   if (!display.isOn()) {
-    display.turnOn();
+    DISPLAY_TURN_ON();
     next_display_refresh = 0;  // force immediate refresh
     return;  // consume this press just to turn on the screen
   }
@@ -1252,7 +1460,7 @@ static void displayLoop() {
   // Auto-off after inactivity
   if (display.isOn() && last_button_activity > 0 &&
       (millis() - last_button_activity) > DISPLAY_AUTO_OFF_MS) {
-    display.turnOff();
+    DISPLAY_TURN_OFF();
   }
 }
 #endif  // DISPLAY_CLASS
@@ -1263,6 +1471,7 @@ static void displayLoop() {
 // mode to the sonar gate, OLED, and mesh transmit/ACK path. Defaults to the
 // low-power deploy cycle; the dev views (STATUS/DEMO/TX_DEBUG) are opt-in via B1.
 #include "modes.h"
+#include "radio_lowpower.h"   // app-side radio SPI-sleep/wake (MeshCore left pristine)
 
 #define PIN_SONAR_GATE     5          // D5 = GPS_EN = AO3400 low-side gate (HIGH = sonar powered)
 #ifndef CYCLE_SECS
@@ -1275,6 +1484,16 @@ static void displayLoop() {
 #define TX_RETRY_MS        5000       // wait this long for an ACK before a retry
 #define TX_MAX_ATTEMPTS    5          // give up after this many sends
 #define WAKE_SETTLE_MS     300        // sonar power-up settle on a plain (timer) wake
+// MODE_SLEEP idle granularity: delay() WFE-sleeps the CPU this long between
+// cadence/button re-checks. At 50 ms the core is woken 20x per second purely to
+// re-read a clock and a pin, and each wake costs. Overridable so the wake rate can
+// be measured as its own variable: the arithmetic (147 uA System-OFF vs ~1066 uA
+// System-ON) says the remaining floor is idle overhead, not a peripheral.
+// Cost of raising it: button-press latency during sleep, and cadence granularity -
+// both irrelevant against a 20 s bench or 300 s deployment cycle.
+#ifndef SLEEP_POLL_MS
+#define SLEEP_POLL_MS      50
+#endif
 #define GESTURE_WINDOW_MS  1500       // bounded button-classify cap in WAKE (> long-press 1200ms)
 #ifndef SONAR_QUIET_MS
 #define SONAR_QUIET_MS     2000       // let the gated sonar fully spin down before TX (RX desense fix)
@@ -1287,6 +1506,9 @@ static int  g_tx_attempts = 0;
 static unsigned long g_tx_sent_at = 0;
 
 static void sonar_power(bool on) {
+#if STRIP_SONAR
+  (void)on; return;                    // bisection arm: sonar layer removed
+#endif
 #ifdef SONAR_FORCE_OFF
   (void)on;
   digitalWrite(PIN_SONAR_GATE, LOW);   // TEST: sonar forced OFF to isolate whether its
@@ -1342,23 +1564,63 @@ static void enter_mode(mode m) {
 
   switch (m) {
     case MODE_POST:
-      display.turnOn();
+      DISPLAY_TURN_ON();
       break;
     case MODE_STATUS:
-      display.turnOn();
+      DISPLAY_TURN_ON();
       break;
     case MODE_SLEEP:
-      display.turnOff();
-      sonar_power(false);            // gate cuts sonar draw -- the main sleep-power lever
+      DISPLAY_TURN_OFF();
+#if SLEEP_RELEASE_UART
+      sonar_serial_end();            // release UARTE0 + both pads BEFORE gating: an enabled
+                                     // UARTE holds HFCLK (~mA) and an active RX pad loads the
+                                     // sensor output while its ground floats. Measured
+                                     // 2026-07-18: this is worth ~5.5 mA of sleep floor.
+#endif
+      sonar_power(false);            // gate cuts sonar draw
       the_mesh.linkLedOff();         // force the lamp dark for sleep, even after a fully-failed transmit
+      radio_sleep_lp();              // SPI-sleep the radio (~1uA); loop() then skips the_mesh.loop() while slept
+#if SLEEP_RELEASE_TWI
+      Wire.end();                    // TWIM is another always-enabled HFCLK holder; the
+                                     // display is already off, so the bus has no user here
+#endif
+#if SLEEP_PIN_DISCONNECT_AUDIT
+      sleep_pins_disconnect();       // LAST: after every release above, silence the listed
+                                     // pads (buffer-disconnected). Wake bring-up rewrites
+                                     // each pin's PIN_CNF, so there is no restore to forget.
+#endif
+#if SLEEP_DIAG
+      sleep_diag_dump();             // state snapshot AFTER all releases, before the idle loop
+#endif
+#if SLEEP_DISABLE_USBD
+      if (!(NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk)) {
+        NRF_USBD->ENABLE = 0;        // battery only: drop USBD so it stops holding HFCLK.
+                                     // One-way until reset; VBUS-present skips this entirely.
+      }
+#endif
+#if SLEEP_HFCLK_STOP
+      if (!(NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk)) {
+        NRF_CLOCK->TASKS_HFCLKSTOP = 1;   // battery only: release the latched HFXO.
+                                          // HF users fall back to HFINT on demand.
+      }
+#endif
       break;
     case MODE_WAKE:
+#if SLEEP_RELEASE_TWI
+      Wire.begin();                  // bus back up before anything talks to the display
+#endif
+      radio_wake_lp();               // wake radio + re-arm Rx before measure/transmit; un-pauses the mesh
       sonar_power(true);
+#if SLEEP_RELEASE_UART
+      sonar_serial_begin();          // UARTE0 back up, D1 reclaimed as the pin-4 strobe.
+                                     // Paired with the sleep-side release: if we did not
+                                     // release, we must not re-begin.
+#endif
       break;
     case MODE_MEASURE:
       break;
     case MODE_TRANSMIT:
-      display.turnOff();
+      DISPLAY_TURN_OFF();
       sonar_power(false);            // sonar off for the TX/ACK window: its gated power/RF
                                      // noise desenses the radio RX (bench-confirmed). The
                                      // reading was already cached in MODE_MEASURE.
@@ -1369,11 +1631,11 @@ static void enter_mode(mode m) {
       g_tx_sent_at = millis();
       break;
     case MODE_DEMO:
-      display.turnOn();
+      DISPLAY_TURN_ON();
       sonar_power(true);
       break;
     case MODE_TRANSMIT_DEBUG:
-      display.turnOn();
+      DISPLAY_TURN_ON();
       g_tx_attempts = 1;
       the_mesh.sendSensorReading();
       g_tx_sent_at = millis();
@@ -1405,8 +1667,23 @@ static void mode_loop() {
       me.elapsed = (in_mode > STATUS_SECS * 1000UL);
       break;
     case MODE_SLEEP:
-      // display off + sonar gated off; wait out the cadence or a button. v1
-      // baseline power; the bench step (#98) swaps this poll for RTC+GPIOTE wake.
+      // Display off + sonar gated off. CPU idle via FreeRTOS delay(): vTaskDelay
+      // blocks this task so the core WFE-sleeps in the idle task, and the RTC-
+      // driven RTOS tick reliably resumes us to re-check the cadence + button.
+      // (A raw waitForEvent() here hung on battery -- with USB, CDC interrupts were
+      // masking it by waking WFE; the JS220 caught the stuck node. delay() is the
+      // FreeRTOS-correct low-power idle.) Stage 2: radio.sleep() for the ~147uA
+      // floor per the sleep_test derisking; radio still RX-listening here (~8mA floor).
+#if SLEEP_FPU_CLEAR
+      // Errata 87: a float op latches the FPU exception -> FPU IRQ pending ->
+      // WFE returns immediately and the idle task spins instead of sleeping.
+      // QT1 measured fpu_pend=1 at sleep entry on this firmware. Clear the
+      // FPSCR exception bits and the pending IRQ before each idle interval.
+      __set_FPSCR(__get_FPSCR() & ~(0x0000009FUL));
+      (void) __get_FPSCR();
+      NVIC_ClearPendingIRQ(FPU_IRQn);
+#endif
+      delay(SLEEP_POLL_MS);
       if (in_mode > CYCLE_SECS * 1000UL) { g_woke_by_button = false; me.elapsed = true; }
       else if (user_btn.isPressed())     { g_woke_by_button = true; }   // raw level; preserves the gesture for WAKE
       me.woke_by_button = g_woke_by_button;
@@ -1489,6 +1766,23 @@ void setup() {
   Serial.println("setup: board.begin()...");
   board.begin();
 
+#if PWR_ENABLE_DCDC
+  // RookBoard::begin() calls NRF52Board::begin(), skipping NRF52BoardDCDC::begin(),
+  // so the DC/DC enable never fires and the board runs on the LDO. Do it here
+  // rather than patching Don's board file. Must come AFTER board.begin(), which is
+  // where the SoftDevice comes up.
+  {
+    uint8_t sd_enabled = 0;
+    sd_softdevice_is_enabled(&sd_enabled);
+    if (sd_enabled) {
+      sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
+    } else {
+      NRF_POWER->DCDCEN = 1;
+    }
+    Serial.println("setup: DC/DC regulator ENABLED (PWR_ENABLE_DCDC=1)");
+  }
+#endif
+
   // Bring the radio up with the sonar gate OFF. The Rook's SX1262 runs on a TCXO;
   // switching the gated sonar rail (AO3400 on pin 5) on during radio_init sags the
   // supply right as the TCXO starts -> XOSC_START_ERR (0x0020) and an off-frequency
@@ -1508,6 +1802,14 @@ void setup() {
 
   fast_rng.begin(radio_get_rng_seed());
 
+#if STRIP_MESH
+  // S3+: no mesh, no cadence -- the arm is a bare sleep floor. Warm-sleep the
+  // radio right after init (the v4 pattern) and let the stripped loop() idle.
+  radio_sleep_lp();
+  Serial.println("setup: STRIP_MESH -- radio warm-slept, entering bare idle loop.");
+#endif
+
+#if !STRIP_SONAR
   // radio is up and stable -- now power the sonar for the MaxBotix probe + cycles
   sonar_power(true);
 
@@ -1515,7 +1817,10 @@ void setup() {
   // Wire the MaxBotix pin 5 (serial TX) to the Rook's Serial1 RX pin; no TX
   // wire back is needed. Power: 3.0-5.5 V on pin 6, ground on pin 7.
   Serial.println("setup: probing MaxBotix on Serial1 @ 9600 baud...");
-  Serial1.begin(ULTRASONIC_BAUD);
+  // Brings up UARTE0 and reclaims D1 from Serial1's TXD so pin 4 is a GPIO strobe
+  // (else it idles HIGH and the sensor free-runs). Same helper the wake path uses.
+  sonar_serial_begin();
+  digitalWrite(PIN_STROBE, HIGH);   // range during the probe window
   // Give the sensor up to ~500 ms to emit a first frame so we can flag
   // has_sensor on the OLED. has_sensor will be re-asserted on every successful
   // updateSensorReadings() anyway.
@@ -1543,9 +1848,11 @@ void setup() {
       has_sensor = false;
       Serial.println("No MaxBotix frames on Serial1 (check wiring / 9600 baud).");
     }
+    digitalWrite(PIN_STROBE, LOW);   // stop ranging; cycles command it per reading
   }
+#endif  /* !STRIP_SONAR */
 
-#ifdef DISPLAY_CLASS
+#if defined(DISPLAY_CLASS) && !STRIP_DISPLAY
   if (display.begin()) {
     display.startFrame();
     display.setCursor(0, 0);
@@ -1554,19 +1861,30 @@ void setup() {
   }
 #endif
 
+#if STRIP_FS && !STRIP_MESH
+#error "STRIP_FS requires STRIP_MESH: the_mesh.begin() needs the filesystem"
+#endif
+#if !STRIP_FS
   Serial.println("setup: filesystem.begin()...");
 #if defined(NRF52_PLATFORM)
   InternalFS.begin();
-  Serial.println("setup: the_mesh.begin() -- if first-boot, will block here on 'Press ENTER to generate key:'");
-  the_mesh.begin(InternalFS);
 #elif defined(RP2040_PLATFORM)
   LittleFS.begin();
-  the_mesh.begin(LittleFS);
 #elif defined(ESP32)
   SPIFFS.begin(true);
-  the_mesh.begin(SPIFFS);
 #else
   #error "need to define filesystem"
+#endif
+#endif  /* !STRIP_FS */
+
+#if !STRIP_MESH
+  Serial.println("setup: the_mesh.begin() -- if first-boot, will block here on 'Press ENTER to generate key:'");
+#if defined(NRF52_PLATFORM)
+  the_mesh.begin(InternalFS);
+#elif defined(RP2040_PLATFORM)
+  the_mesh.begin(LittleFS);
+#elif defined(ESP32)
+  the_mesh.begin(SPIFFS);
 #endif
   Serial.println("setup: mesh ready.");
 
@@ -1589,10 +1907,29 @@ void setup() {
 
   // hand control to the field-node mode machine: reset always enters POST.
   enter_mode(MODE_POST);
+#endif  /* !STRIP_MESH */
 }
 
 void loop() {
-  the_mesh.loop();     // MUST keep pumping: services the radio and fires processAck/onSendTimeout
+#if STRIP_MESH
+  // Bare bisection idle: radio already warm-slept in setup, no mesh, no mode
+  // machine. Same per-poll sleep actions the deployment MODE_SLEEP applies.
+#if HEARTBEAT
+  Serial.print("[HB] "); Serial.println(millis());
+#endif
+#if SLEEP_HFCLK_STOP
+  if (!(NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk)) {
+    NRF_CLOCK->TASKS_HFCLKSTOP = 1;
+  }
+#endif
+  delay(SLEEP_POLL_MS);
+#else
+  // Pause the mesh while the radio is SPI-slept (MODE_SLEEP) -- servicing it would
+  // poll the slept radio over SPI and deadlock on BUSY. WAKE re-arms Rx before unpausing.
+  if (!g_radio_slept) {
+    the_mesh.loop();   // services the radio and fires processAck/onSendTimeout
+  }
   rtc_clock.tick();
   mode_loop();         // field-node duty-cycle state machine (replaces displayLoop)
+#endif
 }
