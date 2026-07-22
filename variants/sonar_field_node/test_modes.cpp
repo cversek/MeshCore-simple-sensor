@@ -40,7 +40,7 @@ int main() {
   expect(next_mode(MODE_TRANSMIT, EV(0, false, true)),               MODE_SLEEP,    "TRANSMIT settled -> SLEEP");
 
   // --- The race invariant: button-wake, gesture not yet resolved ---
-  expect(next_mode(MODE_SLEEP,    EV(BUTTON_EVENT_NONE, false, false, true)), MODE_WAKE, "SLEEP + button edge -> WAKE");
+  expect(next_mode(MODE_SLEEP,    EV(BUTTON_EVENT_NONE, false, false, true)), MODE_STATUS, "SLEEP + button edge -> STATUS");
   expect(next_mode(MODE_WAKE,     EV(BUTTON_EVENT_NONE, false, false, true)), MODE_WAKE, "WAKE holds while classifying (no race)");
 
   // --- WAKE routes once the classifier commits ---
@@ -64,8 +64,11 @@ int main() {
   expect(next_mode(MODE_POST,     EV(BUTTON_EVENT_DOUBLE_CLICK, false, false)), MODE_POST,     "POST ignores button");
   expect(next_mode(MODE_TRANSMIT_DEBUG, EV(BUTTON_EVENT_CLICK, false, false)),  MODE_TRANSMIT_DEBUG, "TX_DEBUG ignores button mid-attempt");
 
-  // --- spurious button-wake times out into an early (harmless) measurement ---
-  expect(next_mode(MODE_WAKE,     EV(BUTTON_EVENT_NONE, false, true, true)),    MODE_MEASURE,  "WAKE spurious-wake timeout -> MEASURE");
+  // --- WAKE is timer-only now; settle falls through to the measurement ---
+  expect(next_mode(MODE_WAKE,     EV(BUTTON_EVENT_NONE, false, true, true)),    MODE_MEASURE,  "WAKE settle -> MEASURE");
+  // --- button wake from SLEEP goes straight to STATUS (no gesture dwell) ---
+  expect(next_mode(MODE_SLEEP,    EV(BUTTON_EVENT_NONE, false, false, true)),   MODE_STATUS,   "SLEEP button wake -> STATUS");
+  expect(next_mode(MODE_SLEEP,    EV(BUTTON_EVENT_NONE, true, false, false)),   MODE_WAKE,     "SLEEP timer wake -> WAKE");
 
   printf("\n%d checks, %d failures\n", checks, fails);
   return fails ? 1 : 0;

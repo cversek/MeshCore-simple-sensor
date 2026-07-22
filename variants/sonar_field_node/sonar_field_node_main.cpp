@@ -21,7 +21,7 @@ extern RADIO_CLASS radio;   // RadioLib radio object (target.cpp) -- for getDevi
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "sonar_field_node (build: Jul 2026) [v3-ultrasonic + MaxBotix MB7388 -> distance_meters; duty-cycle mode machine; link-health LED (send=toggle, ACK=off, timeout=on, off on sleep) + STATUS tx-fail count]"
+#define FIRMWARE_VER_TEXT   "sonar_field_node (build: Jul 22 2026, v3.1 gateA fixes) [v3-ultrasonic + MaxBotix MB7388 -> distance_meters; duty-cycle mode machine; link-health LED (send=toggle, ACK=off, timeout=on, off on sleep) + STATUS tx-fail count]"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   910.525
@@ -682,7 +682,8 @@ public:
       return 0;
     }
 
-    updateSensorReadings();
+    // reading was cached in MODE_MEASURE; re-reading here finds the sonar
+    // already gated off and clobbers has_sensor with a false failure
 
     for (uint8_t i = 0; i < target_count; i++) {
       last_send_attempts++;
@@ -1255,13 +1256,19 @@ static void drawPageDots(DisplayDriver& d) {
   }
 }
 
+static bool g_demo_banner = false;   // DEMO renders the status page; banner tells them apart
+
 static void renderStatusPage(DisplayDriver& d) {
   d.setTextSize(1);
   d.setColor(DisplayDriver::LIGHT);
 
-  // Node name and ID
+  // Node name and ID (DEMO banner in demo mode so the pages are tellable apart)
   char buf[32];
-  snprintf(buf, sizeof(buf), "%s [%u]", the_mesh.getNodeName(), (unsigned)the_mesh.getNodeId());
+  if (g_demo_banner) {
+    snprintf(buf, sizeof(buf), "** DEMO ** [%u]", (unsigned)the_mesh.getNodeId());
+  } else {
+    snprintf(buf, sizeof(buf), "%s [%u]", the_mesh.getNodeName(), (unsigned)the_mesh.getNodeId());
+  }
   d.setCursor(0, 10);
   d.print(buf);
 
@@ -1504,6 +1511,8 @@ static unsigned long g_mode_since = 0;   // millis() at mode entry
 static bool g_woke_by_button = false;    // how SLEEP was interrupted (button vs RTC)
 static int  g_tx_attempts = 0;
 static unsigned long g_tx_sent_at = 0;
+static unsigned long g_txdbg_settled_at = 0;
+#define TXDBG_LINGER_MS 3000
 
 static void sonar_power(bool on) {
 #if STRIP_SONAR
@@ -1567,6 +1576,10 @@ static void enter_mode(mode m) {
       DISPLAY_TURN_ON();
       break;
     case MODE_STATUS:
+#if SLEEP_RELEASE_TWI
+      Wire.begin();                  // direct hop from SLEEP: bus up before the panel
+#endif
+      g_demo_banner = false;
       DISPLAY_TURN_ON();
       break;
     case MODE_SLEEP:
@@ -1578,6 +1591,7 @@ static void enter_mode(mode m) {
                                      // 2026-07-18: this is worth ~5.5 mA of sleep floor.
 #endif
       sonar_power(false);            // gate cuts sonar draw
+      NRF_P1->LATCH = (1u << 0);     // stale press latched while awake must not rewake us
       the_mesh.linkLedOff();         // force the lamp dark for sleep, even after a fully-failed transmit
       radio_sleep_lp();              // SPI-sleep the radio (~1uA); loop() then skips the_mesh.loop() while slept
 #if SLEEP_RELEASE_TWI
@@ -1631,11 +1645,17 @@ static void enter_mode(mode m) {
       g_tx_sent_at = millis();
       break;
     case MODE_DEMO:
+      g_demo_banner = true;
       DISPLAY_TURN_ON();
       sonar_power(true);
+#if SLEEP_RELEASE_UART
+      sonar_serial_begin();          // STATUS gateway: UARTE may still be released
+#endif
       break;
     case MODE_TRANSMIT_DEBUG:
       DISPLAY_TURN_ON();
+      radio_wake_lp();               // STATUS gateway: radio may still be slept
+      g_txdbg_settled_at = 0;
       g_tx_attempts = 1;
       the_mesh.sendSensorReading();
       g_tx_sent_at = millis();
@@ -1660,7 +1680,7 @@ static void mode_loop() {
   switch (g_mode) {
     case MODE_POST:
       render_post();
-      me.done = (in_mode > 800);            // brief self-test banner
+      me.done = (in_mode > 3000);           // self-test banner, long enough to read
       break;
     case MODE_STATUS:
       render_status_frame();
@@ -1685,7 +1705,11 @@ static void mode_loop() {
 #endif
       delay(SLEEP_POLL_MS);
       if (in_mode > CYCLE_SECS * 1000UL) { g_woke_by_button = false; me.elapsed = true; }
-      else if (user_btn.isPressed())     { g_woke_by_button = true; }   // raw level; preserves the gesture for WAKE
+      else if (btn != BUTTON_EVENT_NONE || user_btn.isPressed() ||
+               (NRF_P1->LATCH & (1u << 0))) {
+        NRF_P1->LATCH = (1u << 0);   // consume the hardware-latched edge
+        g_woke_by_button = true;
+      }
       me.woke_by_button = g_woke_by_button;
       break;
     case MODE_WAKE:
@@ -1726,8 +1750,11 @@ static void mode_loop() {
     case MODE_TRANSMIT_DEBUG: {
       render_tx_debug();
       AckStatus s = the_mesh.getLastAckStatus();
-      if (s == ACK_STATUS_OK || s == ACK_STATUS_TIMEOUT || (millis() - g_tx_sent_at) > TX_RETRY_MS)
-        me.done = true;
+      bool settled = (s == ACK_STATUS_OK || s == ACK_STATUS_TIMEOUT ||
+                      (millis() - g_tx_sent_at) > TX_RETRY_MS);
+      if (settled && g_txdbg_settled_at == 0) g_txdbg_settled_at = millis();
+      if (settled && (millis() - g_txdbg_settled_at) > TXDBG_LINGER_MS)
+        me.done = true;   // linger so the outcome is readable before leaving
       break;
     }
     default:
@@ -1736,7 +1763,7 @@ static void mode_loop() {
 
   mode next = next_mode(g_mode, me);
   if (next != g_mode) {
-    if (g_mode == MODE_WAKE) g_woke_by_button = false;   // wake consumed
+    if (g_mode == MODE_SLEEP || g_mode == MODE_WAKE) g_woke_by_button = false;   // wake consumed on SLEEP exit
     enter_mode(next);
   }
 }
@@ -1790,6 +1817,16 @@ void setup() {
   // bulk decoupling on the sonar rail is the follow-up.)
   pinMode(PIN_SONAR_GATE, OUTPUT);
   sonar_power(false);              // keep sonar off through radio startup
+
+  // Without begin() the nRF pin's input buffer stays disconnected and
+  // digitalRead never sees the button, no matter what the pad does.
+  user_btn.begin();
+  // Polled sampling misses taps that start and end between polls. SENSE-low
+  // makes the port's LATCH register catch the falling edge in hardware (async,
+  // no clock, no interrupt); the sleep poll reads and clears it. Same SENSE
+  // machinery a future System-OFF button-wake needs.
+  NRF_P1->PIN_CNF[0] |= (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos);
+  NRF_P1->LATCH = (1u << 0);
 
   Serial.println("setup: radio_init()...");
   if (!radio_init()) {

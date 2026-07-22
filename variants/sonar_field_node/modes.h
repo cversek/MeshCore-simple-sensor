@@ -92,12 +92,14 @@ static inline mode next_mode(mode cur, mode_event ev) {
       }
       return ev.elapsed ? MODE_SLEEP : MODE_STATUS;
     case MODE_SLEEP:
-      // don't interpret the gesture here; any wake powers up in WAKE and the
-      // identity/transition is decided there, with peripherals live.
-      return (ev.woke_by_button || ev.elapsed) ? MODE_WAKE : MODE_SLEEP;
+      // a button wake goes STRAIGHT to STATUS -- no gesture-classification
+      // dwell; STATUS is the gateway to the dev modes. Timer wakes take the
+      // WAKE bring-up path into the deploy measurement.
+      if (ev.woke_by_button) return MODE_STATUS;
+      return ev.elapsed ? MODE_WAKE : MODE_SLEEP;
     case MODE_WAKE:
-      // a gesture classified after wakeup routes to a dev mode; a plain timer
-      // wake (no gesture) falls through to the deploy measurement.
+      // timer-wake bring-up; button wakes route to STATUS from SLEEP now, so
+      // this settles the peripherals and falls through to the measurement.
       next = handle_button_gesture(ev);
       if (next != MODE_NONE) {
         return next;
