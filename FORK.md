@@ -77,3 +77,6 @@ that was not reached.
 
 Upstream firmware and the ultrasonic adaptation: Don Blair, Edge Collective.
 The mesh protocol work belongs to the MeshCore project.
+
+Development of this fork was assisted by Anthropic's Claude Code agentic
+platform, using the Opus 4.8 and Fable 5 models.
