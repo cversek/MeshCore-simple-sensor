@@ -16,9 +16,11 @@
 #include <RTClib.h>
 #include <target.h>
 
+extern RADIO_CLASS radio;   // RadioLib radio object (defined in target.cpp) -- for getDeviceErrors()
+
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "companion_sensor v3-ultrasonic (build: May 2026) [v3 + MaxBotix MB7388 → distance_meters]"
+#define FIRMWARE_VER_TEXT   "companion_sensor v3-ultrasonic (build: Jul 2026) [v3 + MaxBotix MB7388 → distance_meters] [DEBUG: link-health LED (send=toggle, ACK=off, timeout=on) + OLED tx/ack counters + display always-on]"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   910.525
@@ -109,7 +111,7 @@ static float last_dist_m = 0;     // meters, parsed from MaxBotix
 static float last_batt = 0;
 static bool has_reading = false;
 
-// v3: last-send ACK status — surfaced on the OLED status page so a button-triggered
+// v3: last-send ACK status -- surfaced on the OLED status page so a button-triggered
 // send shows whether the receiver actually acknowledged.
 enum AckStatus {
   ACK_STATUS_NONE = 0,
@@ -148,6 +150,23 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   AckStatus last_ack_status;
   uint32_t last_ack_rt_ms;            // round-trip ms of the most recent ACK (serial log only)
   unsigned long last_ack_at_millis;   // millis() when the most recent OK ACK arrived
+
+  // debug: lifetime counters surfaced on the OLED. packets_tx = sensor packets
+  // handed to the radio; packets_ack = ACKs matched back. Watching the gap (and
+  // whether tx keeps climbing) makes the one-and-done wedge visible at a glance.
+  uint32_t packets_tx;
+  uint32_t packets_ack;
+
+  // debug: link-health LED state. Three rules drive it: a send TOGGLES it
+  // (packet in flight), a positive ACK forces it OFF (healthy), a timeout forces
+  // it ON (problem). Net: healthy link rests dark with a brief per-cycle ON
+  // pulse; a failing link sits lit with a short OFF blink at each resend.
+  bool led_on;
+  void ledWrite(bool on) {
+    led_on = on;
+    digitalWrite(LED_PIN, (on == (LED_STATE_ON != 0)) ? HIGH : LOW);
+  }
+  void ledToggle() { ledWrite(!led_on); }
 
   void loadContacts() {
     if (_fs->exists("/contacts")) {
@@ -445,6 +464,7 @@ public:
   int sendSensorReading() {
     last_send_successes = 0;
     last_send_attempts = 0;
+    uint16_t err_before = radio.getDeviceErrors();
 
     if (target_count == 0) {
       Serial.println("   No targets set, skipping send (use 'target add <name>')");
@@ -506,6 +526,12 @@ public:
         Serial.print(") ");
       }
 
+      // debug: toggle the LED the instant BEFORE we hit the radio (packet in
+      // flight). processAck() will drive it OFF on a good ACK, onSendTimeout()
+      // ON on a miss. If the SX1262 wedges inside the send, the LED will have
+      // toggled but no "sent" line prints and packets_tx won't advance.
+      ledToggle();
+
       uint32_t est_timeout;
       int result = sendMessage(*recipient, getRTCClock()->getCurrentTime(), 0, msg, expected_ack_crc, est_timeout);
       if (result == MSG_SEND_FAILED) {
@@ -516,10 +542,14 @@ public:
         last_ack_status = ACK_STATUS_PENDING;
         Serial.println(result == MSG_SEND_SENT_FLOOD ? "sent (FLOOD)" : "sent (DIRECT)");
         last_send_successes++;
+        packets_tx++;  // debug: count packets the radio actually accepted
       }
     }
 
     Serial.printf("   (%d/%d sent)\n", last_send_successes, last_send_attempts);
+    // Probe the SX1262's own fault register around the transmit. 0x0000 = clean;
+    // bits flip if the TX surge wedged it: 0x20=XOSC_START 0x40=PLL_LOCK 0x100=PA_RAMP.
+    Serial.printf("   [RADIO_ERR] before=0x%04X after=0x%04X\n", err_before, radio.getDeviceErrors());
     return last_send_successes;
   }
 
@@ -543,8 +573,10 @@ public:
   AckStatus getLastAckStatus() const { return last_ack_status; }
   uint32_t getLastAckRoundTripMs() const { return last_ack_rt_ms; }
   unsigned long getLastAckAtMillis() const { return last_ack_at_millis; }
+  uint32_t getPacketsTx() const { return packets_tx; }
+  uint32_t getPacketsAck() const { return packets_ack; }
 
-  // Read the sensor + battery and cache the values WITHOUT sending — used by
+  // Read the sensor + battery and cache the values WITHOUT sending -- used by
   // the OLED's Send page so the user can see a fresh reading before deciding
   // to long-press send. Blocks for up to ULTRASONIC_READ_TIMEOUT_MS.
   void refreshReading() { updateSensorReadings(); }
@@ -624,6 +656,8 @@ protected:
       last_ack_rt_ms = _ms->getMillis() - last_msg_sent;
       last_ack_at_millis = millis();
       last_ack_status = ACK_STATUS_OK;
+      packets_ack++;  // debug: count matched ACKs for the OLED tx/ack line
+      ledWrite(false);  // debug: good ACK -> LED OFF (link healthy)
       Serial.printf("   Got ACK! (round trip: %lu millis)\n", (unsigned long)last_ack_rt_ms);
       expected_ack_crc = 0;
       return NULL;
@@ -662,11 +696,12 @@ protected:
 
   void onSendTimeout() override {
     // If processAck already cleared expected_ack_crc, the ACK arrived just as the
-    // timeout fired — treat this as a late-but-no-op timeout and skip invalidation.
+    // timeout fired -- treat this as a late-but-no-op timeout and skip invalidation.
     // Without this guard, a slow-but-successful FLOOD round-trip would invalidate
     // the path we just learned from the receiver's PATH-return.
     if (expected_ack_crc == 0) return;
     last_ack_status = ACK_STATUS_TIMEOUT;
+    ledWrite(true);  // debug: no ACK -> LED ON (link problem); next resend blinks it off
 
     // v2: on timeout, invalidate the cached out_path for the most recent target.
     // The NEXT scheduled send will flood, which forces a fresh path discovery on
@@ -704,6 +739,9 @@ public:
     last_ack_status = ACK_STATUS_NONE;
     last_ack_rt_ms = 0;
     last_ack_at_millis = 0;
+    packets_tx = 0;
+    packets_ack = 0;
+    led_on = false;
     node_id = 1;
   }
 
@@ -842,6 +880,15 @@ public:
     } else if (strcmp(command, "send") == 0) {
       Serial.println("   Sending sensor reading now...");
       sendSensorReading();
+    } else if (memcmp(command, "gate", 4) == 0) {
+      // Coupling probe: D5/GPS_EN is the low-side sonar gate (Q2). Toggle it
+      // live and watch the radio -- 'gate on' should break ACKs, 'gate off' should
+      // restore them (or not, if the disturbance latches). Characterizes the
+      // GPS_EN -> radio-RX coupling with the radio otherwise fully working.
+      const char* a = command + 4; while (*a == ' ') a++;
+      if (strcmp(a, "on") == 0)       { digitalWrite(5, HIGH); Serial.println("   GATE D5/GPS_EN = ON"); }
+      else if (strcmp(a, "off") == 0) { digitalWrite(5, LOW);  Serial.println("   GATE D5/GPS_EN = OFF"); }
+      else Serial.printf("   GATE D5/GPS_EN = %s\n", digitalRead(5) ? "ON" : "OFF");
     } else if (memcmp(command, "list", 4) == 0) {
       int n = 0;
       if (command[4] == ' ') {
@@ -940,6 +987,17 @@ public:
     BaseChatMesh::loop();
 
     // Check if it's time to send a sensor reading
+#ifdef SEND_TIMER_MILLIS
+    // millis()-based gate: direct test of whether the RTC clock (getCurrentTime)
+    // fails to advance without GPS/NTP, capping repeat sends at one boot packet.
+    static unsigned long last_send_ms = 0;
+    if (last_send_ms == 0 || (millis() - last_send_ms) >= (unsigned long)send_interval_secs * 1000UL) {
+      updateSensorReadings();
+      Serial.printf("[SENSOR] node_id=%u dist=%.3fm batt=%.2fV\n", (unsigned)node_id, last_dist_m, last_batt);
+      sendSensorReading();
+      last_send_ms = millis();
+    }
+#else
     uint32_t now = getRTCClock()->getCurrentTime();
     if (now > 0 && (last_send_time == 0 || (now - last_send_time) >= send_interval_secs)) {
       updateSensorReadings();
@@ -947,6 +1005,7 @@ public:
       sendSensorReading();
       last_send_time = now;
     }
+#endif
 
     // Serial command handling
     int len = strlen(command);
@@ -1051,34 +1110,35 @@ static void renderStatusPage(DisplayDriver& d) {
   d.setCursor(0, 46);
   d.print(buf);
 
-  // v3: last ACK status. After a button-triggered send, this is the user's
-  // "did the receiver hear me?" feedback: sending… → ACK Xs/Xm/Xh ago / no ACK.
-  // Falls back to the send interval when no send has happened this boot.
+  // debug: transmit/ack counters + a short last-ACK freshness token, all on the
+  // bottom line so a wedge reads at a glance. T = packets handed to the radio,
+  // A = ACKs matched back. The one-and-done signature is T frozen at 1 with A=0.
+  char ack_tok[10];
   switch (the_mesh.getLastAckStatus()) {
     case ACK_STATUS_OK: {
-      unsigned long age_ms = millis() - the_mesh.getLastAckAtMillis();
-      unsigned long age_s = age_ms / 1000UL;
+      unsigned long age_s = (millis() - the_mesh.getLastAckAtMillis()) / 1000UL;
       if (age_s < 60) {
-        snprintf(buf, sizeof(buf), "Last: ACK %lus ago", age_s);
+        snprintf(ack_tok, sizeof(ack_tok), "%lus", age_s);
       } else if (age_s < 3600) {
-        snprintf(buf, sizeof(buf), "Last: ACK %lum ago", age_s / 60);
-      } else if (age_s < 86400) {
-        snprintf(buf, sizeof(buf), "Last: ACK %luh ago", age_s / 3600);
+        snprintf(ack_tok, sizeof(ack_tok), "%lum", age_s / 60);
       } else {
-        snprintf(buf, sizeof(buf), "Last: ACK %lud ago", age_s / 86400);
+        snprintf(ack_tok, sizeof(ack_tok), "%luh", age_s / 3600);
       }
       break;
     }
     case ACK_STATUS_PENDING:
-      snprintf(buf, sizeof(buf), "Last: sending...");
+      StrHelper::strncpy(ack_tok, "pend", sizeof(ack_tok));
       break;
     case ACK_STATUS_TIMEOUT:
-      snprintf(buf, sizeof(buf), "Last: no ACK");
+      StrHelper::strncpy(ack_tok, "noack", sizeof(ack_tok));
       break;
     default:
-      snprintf(buf, sizeof(buf), "Every %ds", (int)the_mesh.getSendInterval());
+      StrHelper::strncpy(ack_tok, "--", sizeof(ack_tok));
       break;
   }
+  snprintf(buf, sizeof(buf), "T:%lu A:%lu %s",
+           (unsigned long)the_mesh.getPacketsTx(),
+           (unsigned long)the_mesh.getPacketsAck(), ack_tok);
   d.setCursor(0, 56);
   d.print(buf);
 }
@@ -1162,7 +1222,7 @@ static void handleButtonEvents() {
     next_display_refresh = 0;  // force immediate refresh
 
     // Landing on the Send page kicks off an immediate sensor read so the page
-    // shows a live preview — easy way to verify the sensor is alive without
+    // shows a live preview -- easy way to verify the sensor is alive without
     // sending anything over the radio.
     if (current_page == PAGE_SEND) {
       the_mesh.refreshReading();
@@ -1173,7 +1233,7 @@ static void handleButtonEvents() {
       uint8_t succ = the_mesh.getLastSendSuccesses();
       uint8_t att = the_mesh.getLastSendAttempts();
       if (att == 0) {
-        // No `target add …` has been done yet — make this very explicit.
+        // No `target add …` has been done yet -- make this very explicit.
         showAlert("Target not set");
       } else {
         // Switch to status page so the user can watch the "Last: …" line cycle
@@ -1204,11 +1264,14 @@ static void displayLoop() {
   handleButtonEvents();
   renderDisplay();
 
-  // Auto-off after inactivity
-  if (display.isOn() && last_button_activity > 0 &&
-      (millis() - last_button_activity) > DISPLAY_AUTO_OFF_MS) {
-    display.turnOff();
-  }
+  // debug: auto-off is DISABLED for this build so the tx/ack counters stay
+  // visible across the room during a link watch. (Production sonar_field_node
+  // keeps its own sleep/blank logic; this is the always-on bench node.)
+  // Auto-off after inactivity -- intentionally left off:
+  // if (display.isOn() && last_button_activity > 0 &&
+  //     (millis() - last_button_activity) > DISPLAY_AUTO_OFF_MS) {
+  //   display.turnOff();
+  // }
 }
 #endif  // DISPLAY_CLASS
 
@@ -1229,12 +1292,23 @@ void setup() {
   Serial.println("================================================");
   Serial.println("setup: Serial up.");
 
+  // debug: onboard LED is our hardware TX heartbeat (P0.15, active-high). We
+  // toggle it just before every radio send so a transmit attempt is visible
+  // even if the USB console/OLED freezes -- a frozen LED == a stalled TX path.
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LED_STATE_ON ? LOW : HIGH);  // start off
+
+  // Probe: D5/GPS_EN = sonar low-side gate (Q2). Start OFF (radio clean);
+  // toggle live via the 'gate on|off' serial command to watch the coupling.
+  pinMode(5, OUTPUT);
+  digitalWrite(5, LOW);
+
   Serial.println("setup: board.begin()...");
   board.begin();
 
   Serial.println("setup: radio_init()...");
   if (!radio_init()) {
-    Serial.println("setup: radio_init() FAILED — halting.");
+    Serial.println("setup: radio_init() FAILED -- halting.");
     halt();
   }
   Serial.println("setup: radio OK.");
@@ -1287,7 +1361,7 @@ void setup() {
   Serial.println("setup: filesystem.begin()...");
 #if defined(NRF52_PLATFORM)
   InternalFS.begin();
-  Serial.println("setup: the_mesh.begin() — if first-boot, will block here on 'Press ENTER to generate key:'");
+  Serial.println("setup: the_mesh.begin() -- if first-boot, will block here on 'Press ENTER to generate key:'");
   the_mesh.begin(InternalFS);
 #elif defined(RP2040_PLATFORM)
   LittleFS.begin();
