@@ -1,8 +1,7 @@
-# About this fork
+# Development log: the water-level field node
 
-This is a fork of [`edgecollective/MeshCore-simple-sensor`](https://github.com/edgecollective/MeshCore-simple-sensor),
-Don Blair's MeshCore-based sensor firmware. It carries the work of turning the
-v3-ultrasonic companion sensor into a deployable, duty-cycled water-level node:
+This documents the work, June-July 2026, of turning the v3-ultrasonic
+companion sensor into a deployable, duty-cycled water-level node:
 a MaxBotix MB7388 ultrasonic rangefinder measures the distance down to a water
 surface, and the reading travels over LoRa (Long Range, a low-power radio scheme
 that carries small packets for kilometers) through a mesh network to a gateway.
@@ -13,10 +12,10 @@ Upstream baseline for everything here:
 615ebd4531bf6536e21f1316d887506f8917d086  "version 3+"
 ```
 
-Don had already done the hard half. The v3-ultrasonic example supplies the mesh
-layer, the acknowledgement state machine, the flood fallback and the
-non-forwarding leaf behavior. None of that was re-derived. What this fork adds
-is the sensor integration, the power work needed to run the thing on a battery
+The v3-ultrasonic example already supplied the hard half: the mesh layer, the
+acknowledgement state machine, the flood fallback and the non-forwarding leaf
+behavior. None of that was re-derived. What this work adds is the sensor
+integration, the power work needed to run the thing on a battery
 in the field, and the bench validation that caught what the first dock-side
 deployment would otherwise have found the hard way.
 
@@ -44,11 +43,11 @@ intentional and worth preserving.
 
 **The history here is a reconstruction, not archaeology.** The firmware was
 developed on the bench between June and July 2026 and was not committed
-incrementally at the time. The branches and pull requests in this fork were
-authored afterwards, from dated engineering notes and instrument captures, to
+incrementally at the time. The branches and pull requests were authored
+afterwards, from dated engineering notes and instrument captures, to
 present the work as an ordered and reviewable sequence.
 
-So the commit dates are not when the work happened, and the sequence is tidier
+The commit dates are therefore not when the work happened, and the sequence is tidier
 than the actual path was. Each pull request describes what was measured and when,
 including the wrong turns, because several of the conclusions along the way were
 wrong and had to be retracted. Those retractions are part of the record on
@@ -75,8 +74,8 @@ that was not reached.
 
 ## Credit
 
-Upstream firmware and the ultrasonic adaptation: Don Blair, Edge Collective.
+Base firmware and the ultrasonic adaptation: Don Blair, Edge Collective.
 The mesh protocol work belongs to the MeshCore project.
 
-Development of this fork was assisted by Anthropic's Claude Code agentic
-platform, using the Opus 4.8 and Fable 5 models.
+Development was assisted by Anthropic's Claude Code agentic platform, using
+the Opus 4.8 and Fable 5 models.
